@@ -79,6 +79,11 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def compute_dynamic_n_action_steps(lambda_value: float, n_min: int, n_max: int) -> int:
+    lambda_value = max(0.0, min(1.0, float(lambda_value)))
+    return max(n_min, min(n_max, round(n_max - lambda_value * (n_max - n_min))))
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -253,6 +258,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._lambda_smooth = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -345,15 +351,36 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+            n_exec = self._update_dynamic_n_action_steps(getattr(self.model, "last_lambda_hat", None))
+            self._queues[ACTION].extend(actions.transpose(0, 1)[:n_exec])
 
         return self._queues[ACTION].popleft()
 
     def _check_get_actions_condition(self) -> bool:
         return len(self._queues[ACTION]) == 0
 
+    def _update_dynamic_n_action_steps(self, lambda_hat: Tensor | None) -> int:
+        if not self.config.dynamic_n_action_steps or lambda_hat is None:
+            return self.config.n_action_steps
+
+        lambda_now = float(lambda_hat.detach().float().mean().clamp(0.0, 1.0).cpu().item())
+        if self._lambda_smooth is None:
+            self._lambda_smooth = lambda_now
+        else:
+            beta = self.config.lambda_ema_beta
+            self._lambda_smooth = beta * self._lambda_smooth + (1.0 - beta) * lambda_now
+        return compute_dynamic_n_action_steps(
+            self._lambda_smooth,
+            n_min=self.config.dynamic_n_action_steps_min,
+            n_max=min(self.config.dynamic_n_action_steps_max, self.config.chunk_size),
+        )
+
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def update(self):
+        if hasattr(self.model, "update_lambda_train_step"):
+            self.model.update_lambda_train_step()
 
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
@@ -379,7 +406,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        model_output = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            lambda_t=batch.get("lambda_t"),
+            lambda_is_valid=batch.get("lambda_is_valid"),
+        )
+        losses = model_output["losses"]
+        lambda_hat = model_output.get("lambda_hat")
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -393,6 +433,28 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        lambda_loss = None
+        lambda_loss_per_sample = None
+        lambda_t = batch.get("lambda_t")
+        lambda_is_valid = batch.get("lambda_is_valid")
+        if lambda_hat is not None and lambda_t is not None and lambda_is_valid is not None:
+            lambda_t = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
+            lambda_is_valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(
+                lambda_hat
+            )
+            if self.config.lambda_loss_type == "smooth_l1":
+                raw_lambda_loss = F.smooth_l1_loss(lambda_hat, lambda_t, reduction="none")
+            else:
+                raw_lambda_loss = F.mse_loss(lambda_hat, lambda_t, reduction="none")
+            lambda_loss_per_sample = torch.where(
+                lambda_is_valid, raw_lambda_loss, torch.zeros_like(raw_lambda_loss)
+            )
+            valid_count = lambda_is_valid.sum().clamp_min(1)
+            lambda_loss = lambda_loss_per_sample.sum() / valid_count
+            loss_dict["lambda_loss"] = lambda_loss.item()
+            loss_dict["lambda_hat_mean"] = lambda_hat.detach().mean().item()
+            loss_dict["lambda_valid_frac"] = lambda_is_valid.float().mean().item()
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over valid (time, action) entries
             if actions_is_pad is None:
@@ -400,6 +462,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            if lambda_loss_per_sample is not None:
+                per_sample_loss = per_sample_loss + self.config.lambda_loss_weight * lambda_loss_per_sample
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -409,6 +473,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
+            if lambda_loss is not None:
+                loss = loss + self.config.lambda_loss_weight * lambda_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -592,6 +658,21 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.lambda_head = nn.Sequential(
+            nn.Linear(
+                self.vlm_with_expert.config.text_config.hidden_size,
+                self.vlm_with_expert.config.text_config.hidden_size,
+            ),
+            nn.SiLU(),
+            nn.Linear(self.vlm_with_expert.config.text_config.hidden_size, 1),
+        )
+        self.lambda_token_mlp = nn.Sequential(
+            nn.Linear(1, self.vlm_with_expert.expert_hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
+        )
+        self.register_buffer("lambda_train_step", torch.zeros((), dtype=torch.long), persistent=True)
+        self.last_lambda_hat: Tensor | None = None
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -633,6 +714,41 @@ class VLAFlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
+
+    def compute_lambda_alpha(self) -> float:
+        if self.config.lambda_alpha_warmup_steps == 0:
+            return float(self.config.lambda_alpha_end)
+        progress = min(
+            1.0,
+            float(self.lambda_train_step.item()) / float(self.config.lambda_alpha_warmup_steps),
+        )
+        return float(
+            self.config.lambda_alpha_start
+            + progress * (self.config.lambda_alpha_end - self.config.lambda_alpha_start)
+        )
+
+    def update_lambda_train_step(self) -> None:
+        self.lambda_train_step.add_(1)
+
+    def predict_lambda_from_prefix(self, prefix_out: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        mask = prefix_pad_masks.to(dtype=prefix_out.dtype).unsqueeze(-1)
+        pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        return torch.sigmoid(self.lambda_head(pooled)).squeeze(-1)
+
+    def compute_lambda_condition(
+        self,
+        lambda_hat: Tensor,
+        lambda_t: Tensor | None,
+        lambda_is_valid: Tensor | None,
+        alpha: float,
+    ) -> Tensor:
+        pred = lambda_hat.detach()
+        if lambda_t is None or lambda_is_valid is None:
+            return pred
+        labels = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
+        valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
+        mixed = (1.0 - alpha) * labels + alpha * pred
+        return torch.where(valid, mixed, pred).detach()
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -728,7 +844,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions, timestep, lambda_cond: Tensor | None = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -756,6 +872,12 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
+        if self.config.lambda_conditioning and lambda_cond is not None:
+            lambda_token = self.lambda_token_mlp(lambda_cond[:, None].to(device=device, dtype=dtype))[:, None, :]
+            embs.append(lambda_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks += [1]
+
         # Add to input tokens
         embs.append(action_time_emb)
 
@@ -772,8 +894,18 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        lambda_t=None,
+        lambda_is_valid=None,
+    ) -> dict[str, Tensor | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -787,6 +919,38 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
+
+        if self.config.lambda_conditioning:
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_outputs, past_key_values = self.vlm_with_expert.forward(
+                attention_mask=prefix_att_2d_masks,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+                fill_kv_cache=True,
+            )
+            lambda_hat = self.predict_lambda_from_prefix(
+                prefix_outputs[0].to(dtype=torch.float32), prefix_pad_masks
+            )
+            lambda_cond = self.compute_lambda_condition(
+                lambda_hat=lambda_hat,
+                lambda_t=lambda_t,
+                lambda_is_valid=lambda_is_valid,
+                alpha=self.compute_lambda_alpha(),
+            )
+            v_t = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time,
+                lambda_cond=lambda_cond,
+            )
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+            self.last_lambda_hat = lambda_hat.detach()
+            return {"losses": losses, "lambda_hat": lambda_hat}
+
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -807,7 +971,7 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        return {"losses": losses, "lambda_hat": None}
 
     def sample_actions(
         self,
@@ -833,7 +997,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -841,6 +1005,14 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        lambda_cond = None
+        if self.config.lambda_conditioning:
+            lambda_hat = self.predict_lambda_from_prefix(
+                prefix_outputs[0].to(dtype=torch.float32), prefix_pad_masks
+            )
+            lambda_cond = lambda_hat.detach()
+            self.last_lambda_hat = lambda_cond
+
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -855,6 +1027,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    lambda_cond=lambda_cond,
                 )
 
             if self._rtc_enabled():
@@ -886,9 +1059,12 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        lambda_cond: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, timestep, lambda_cond=lambda_cond
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
