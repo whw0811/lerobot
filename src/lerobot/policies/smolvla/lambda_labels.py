@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -402,7 +402,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         "repo_id": args.repo_id,
         "root": args.root,
         "revision": args.revision,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "chunk_size": cfg.chunk_size,
         "anchor_indices": list(cfg.anchor_indices),
         "query_indices": list(cfg.query_indices),
