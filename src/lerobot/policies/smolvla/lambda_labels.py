@@ -96,9 +96,7 @@ def compute_pchip_trend(action_chunks: Tensor, cfg: LambdaLabelConfig) -> Tensor
     if input_was_unbatched:
         action_chunks = action_chunks.unsqueeze(0)
     if action_chunks.ndim != 3:
-        raise ValueError(
-            f"Expected action chunks shaped [N, {cfg.chunk_size}, D] or [{cfg.chunk_size}, D]"
-        )
+        raise ValueError(f"Expected action chunks shaped [N, {cfg.chunk_size}, D] or [{cfg.chunk_size}, D]")
     if action_chunks.shape[1] != cfg.chunk_size:
         raise ValueError(f"Expected chunk_size={cfg.chunk_size}, got {action_chunks.shape[1]}")
 
@@ -130,7 +128,9 @@ def scatter_query_residuals(query_residuals: Tensor, action_dim: int, cfg: Lambd
     return residuals
 
 
-def compute_lambda_metrics(a_t: Tensor, a_trend: Tensor, a_residual: Tensor, cfg: LambdaLabelConfig) -> LambdaMetrics:
+def compute_lambda_metrics(
+    a_t: Tensor, a_trend: Tensor, a_residual: Tensor, cfg: LambdaLabelConfig
+) -> LambdaMetrics:
     if a_t.shape != a_trend.shape or a_t.shape != a_residual.shape:
         raise ValueError("a_t, a_trend, and a_residual must have identical shapes")
     if a_t.ndim != 3 or a_t.shape[1] != cfg.chunk_size:
@@ -201,9 +201,7 @@ def save_lambda_sidecar(
     }
     payload["lambda_by_index"] = {
         int(idx): float(value)
-        for idx, value in zip(
-            payload["valid_indices"].tolist(), payload["lambda_t"].tolist(), strict=True
-        )
+        for idx, value in zip(payload["valid_indices"].tolist(), payload["lambda_t"].tolist(), strict=True)
     }
     if diagnostics is not None:
         payload["diagnostics"] = {key: value.detach().cpu() for key, value in diagnostics.items()}
@@ -275,7 +273,9 @@ def extract_action_chunks_from_dataset(dataset: Any, cfg: LambdaLabelConfig) -> 
             chunks.append(actions[start : start + cfg.chunk_size])
     if not chunks:
         raise ValueError("No valid action chunks were found in the dataset")
-    return ActionChunkBatch(indices=torch.tensor(indices, dtype=torch.long), chunks=torch.stack(chunks, dim=0))
+    return ActionChunkBatch(
+        indices=torch.tensor(indices, dtype=torch.long), chunks=torch.stack(chunks, dim=0)
+    )
 
 
 def train_residual_predictor(
@@ -341,7 +341,9 @@ def generate_lambda_labels_from_chunks(
         },
     }
     if save_diagnostics:
-        limit = chunks.shape[0] if max_diagnostic_chunks is None else min(max_diagnostic_chunks, chunks.shape[0])
+        limit = (
+            chunks.shape[0] if max_diagnostic_chunks is None else min(max_diagnostic_chunks, chunks.shape[0])
+        )
         payload["diagnostics"] = {
             "A_t": chunks[:limit].detach().cpu(),
             "A_trend": trend[:limit].detach().cpu(),
@@ -352,7 +354,9 @@ def generate_lambda_labels_from_chunks(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train SmolVLA residual predictor and generate lambda labels.")
+    parser = argparse.ArgumentParser(
+        description="Train SmolVLA residual predictor and generate lambda labels."
+    )
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--root", default=None)
     parser.add_argument("--revision", default=None)
@@ -376,7 +380,9 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
     cfg = LambdaLabelConfig()
     chunk_batch = extract_action_chunks_from_dataset(dataset, cfg)
     action_norm_mode = NormalizationMode(args.normalization_mode)
-    normalized_chunks = normalize_action_chunks(chunk_batch.chunks, dataset.meta.stats[ACTION], action_norm_mode)
+    normalized_chunks = normalize_action_chunks(
+        chunk_batch.chunks, dataset.meta.stats[ACTION], action_norm_mode
+    )
     train_cfg = ResidualTrainingConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -388,7 +394,9 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
     if args.checkpoint_path is not None:
         checkpoint_path = Path(args.checkpoint_path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model_state_dict": predictor.state_dict(), "config": train_cfg.__dict__}, checkpoint_path)
+        torch.save(
+            {"model_state_dict": predictor.state_dict(), "config": train_cfg.__dict__}, checkpoint_path
+        )
     labels = generate_lambda_labels_from_chunks(
         chunks=normalized_chunks,
         indices=chunk_batch.indices,

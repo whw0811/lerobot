@@ -831,7 +831,7 @@ Modify `SmolVLAConfig` in `src/lerobot/policies/smolvla/configuration_smolvla.py
     lambda_labels_path: str | None = None
     lambda_loss_weight: float = 0.05
     lambda_loss_type: str = "smooth_l1"
-    lambda_conditioning: bool = True
+    lambda_conditioning: bool = False
     lambda_alpha_start: float = 0.0
     lambda_alpha_end: float = 1.0
     lambda_alpha_warmup_steps: int = 30_000

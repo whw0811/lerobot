@@ -107,7 +107,7 @@ class SmolVLAConfig(PreTrainedConfig):
     lambda_labels_path: str | None = None
     lambda_loss_weight: float = 0.05
     lambda_loss_type: str = "smooth_l1"
-    lambda_conditioning: bool = True
+    lambda_conditioning: bool = False
     lambda_alpha_start: float = 0.0
     lambda_alpha_end: float = 1.0
     lambda_alpha_warmup_steps: int = 30_000
@@ -135,6 +135,8 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.lambda_labels_path is not None or self.dynamic_n_action_steps:
+            self.lambda_conditioning = True
         if self.lambda_loss_weight < 0:
             raise ValueError("lambda_loss_weight must be non-negative")
         if self.lambda_loss_type not in {"smooth_l1", "mse"}:

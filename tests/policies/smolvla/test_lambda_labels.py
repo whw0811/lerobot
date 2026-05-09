@@ -18,9 +18,7 @@ from lerobot.policies.smolvla.lambda_labels import (
 
 def test_compute_pchip_trend_preserves_anchor_values():
     pytest.importorskip("scipy")
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     chunks = torch.zeros(2, 10, 3)
     chunks[:, 0] = torch.tensor([0.0, 1.0, 2.0])
     chunks[:, 3] = torch.tensor([3.0, 4.0, 5.0])
@@ -34,9 +32,7 @@ def test_compute_pchip_trend_preserves_anchor_values():
 
 
 def test_scatter_query_residuals_keeps_anchor_residual_zero():
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     query_residuals = torch.ones(4, len(cfg.query_indices), 2)
 
     full_residuals = scatter_query_residuals(query_residuals, action_dim=2, cfg=cfg)
@@ -47,9 +43,7 @@ def test_scatter_query_residuals_keeps_anchor_residual_zero():
 
 
 def test_compute_lambda_metrics_uses_query_positions_and_clamps():
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     chunks = torch.zeros(1, 10, 1)
     trend = torch.zeros_like(chunks)
     residuals = torch.zeros_like(chunks)
@@ -68,9 +62,7 @@ def test_compute_lambda_metrics_uses_query_positions_and_clamps():
 
 
 def test_compute_lambda_metrics_clamps_negative_improvement_to_zero():
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     chunks = torch.zeros(1, 10, 1)
     trend = torch.zeros_like(chunks)
     residuals = torch.zeros_like(chunks)
@@ -120,9 +112,7 @@ def test_lambda_sidecar_lookup_matches_exact_start_indices_only(tmp_path):
 
 
 def test_masked_residual_predictor_outputs_query_residual_shape():
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     predictor = MaskedResidualPredictor(
         chunk_size=10, action_dim=4, num_query_positions=len(cfg.query_indices), hidden_dim=16
     )
@@ -139,14 +129,14 @@ class HalfResidualPredictor(torch.nn.Module):
         self.cfg = cfg
 
     def forward(self, trend: torch.Tensor) -> torch.Tensor:
-        return torch.full((trend.shape[0], len(self.cfg.query_indices), trend.shape[2]), 0.5, device=trend.device)
+        return torch.full(
+            (trend.shape[0], len(self.cfg.query_indices), trend.shape[2]), 0.5, device=trend.device
+        )
 
 
 def test_generate_lambda_labels_from_chunks_saves_requested_diagnostics():
     pytest.importorskip("scipy")
-    cfg = LambdaLabelConfig(
-        chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8)
-    )
+    cfg = LambdaLabelConfig(chunk_size=10, anchor_indices=(0, 3, 6, 9), query_indices=(1, 2, 4, 5, 7, 8))
     chunks = torch.zeros(2, 10, 1)
     chunks[:, cfg.query_indices] = 1.0
     indices = torch.tensor([100, 101])

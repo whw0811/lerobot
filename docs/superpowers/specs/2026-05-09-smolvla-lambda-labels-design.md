@@ -85,7 +85,7 @@ Add configuration fields to `SmolVLAConfig`:
 - `lambda_labels_path: str | None = None`
 - `lambda_loss_weight: float = 0.05`
 - `lambda_loss_type: str = "smooth_l1"`
-- `lambda_conditioning: bool = True`
+- `lambda_conditioning: bool = False`
 - `lambda_alpha_start: float = 0.0`
 - `lambda_alpha_end: float = 1.0`
 - `lambda_alpha_warmup_steps: int = 30000`
@@ -115,7 +115,7 @@ Forward pass behavior:
 - Use `lambda_cond=(1-alpha)*lambda_t + alpha*stopgrad(lambda_hat)` when labels are valid.
 - Use `stopgrad(lambda_hat)` where labels are missing.
 - Add the lambda token before action/timestep suffix tokens: `[lambda_token, noisy_action_tokens]`.
-- Preserve compatibility when `lambda_conditioning=False` or no labels path is configured.
+- Preserve compatibility when neither `lambda_labels_path`, `lambda_conditioning`, nor dynamic execution is configured.
 
 The existing `reduction="none"` path must remain compatible with sample weighting. Per-sample return should include flow loss plus weighted lambda auxiliary loss where valid labels exist.
 
@@ -153,6 +153,6 @@ The implementation should run targeted tests with `uv run pytest tests/policies/
 
 ## Compatibility Notes
 
-Existing SmolVLA configs should behave the same by default. All new training behavior is off unless `lambda_labels_path` or `lambda_conditioning` is configured. Existing RTC behavior remains separate; dynamic `n_action_steps` applies to `select_action`, while RTC users already use `predict_action_chunk`.
+Existing SmolVLA configs should behave the same by default. All new training behavior is off unless `lambda_labels_path`, `lambda_conditioning`, or dynamic execution is configured. Existing RTC behavior remains separate; dynamic `n_action_steps` applies to `select_action`, while RTC users already use `predict_action_chunk`.
 
 The sidecar label approach intentionally avoids changing LeRobotDataset schema, Hub dataset contents, or dataset stats. This makes labels reproducible and replaceable without invalidating the base dataset.

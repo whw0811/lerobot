@@ -57,7 +57,9 @@ def make_config():
 
 
 def test_embed_suffix_adds_lambda_token_before_action_tokens():
-    with patch("lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel):
+    with patch(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel
+    ):
         from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
 
         model = VLAFlowMatching(make_config())
@@ -73,7 +75,9 @@ def test_embed_suffix_adds_lambda_token_before_action_tokens():
 
 
 def test_compute_lambda_condition_mixes_labels_and_stopped_prediction():
-    with patch("lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel):
+    with patch(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel
+    ):
         from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
 
         model = VLAFlowMatching(make_config())
@@ -94,7 +98,9 @@ def test_compute_dynamic_n_action_steps_clamps_rounding():
 
 
 def test_lambda_alpha_schedule_reaches_end_value():
-    with patch("lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel):
+    with patch(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel", FakeSmolVLMWithExpertModel
+    ):
         from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
 
         cfg = make_config()
@@ -107,6 +113,35 @@ def test_lambda_alpha_schedule_reaches_end_value():
     assert model.compute_lambda_alpha() == 0.5
     model.lambda_train_step.fill_(10)
     assert model.compute_lambda_alpha() == 1.0
+
+
+def test_lambda_conditioning_defaults_off_and_auto_enables_for_label_or_dynamic_paths():
+    base_cfg = make_config()
+    base_cfg.lambda_conditioning = False
+    base_cfg.__post_init__()
+    assert base_cfg.lambda_conditioning is False
+
+    label_cfg = make_config()
+    label_cfg.lambda_conditioning = False
+    label_cfg.lambda_labels_path = "lambda_labels.pt"
+    label_cfg.__post_init__()
+    assert label_cfg.lambda_conditioning is True
+
+    dynamic_cfg = make_config()
+    dynamic_cfg.lambda_conditioning = False
+    dynamic_cfg.dynamic_n_action_steps = True
+    dynamic_cfg.__post_init__()
+    assert dynamic_cfg.lambda_conditioning is True
+
+
+def test_default_peft_targets_keep_lambda_modules_trainable():
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+    policy = object.__new__(SmolVLAPolicy)
+    targets = policy._get_default_peft_targets()
+
+    assert "lambda_head" in targets["modules_to_save"]
+    assert "lambda_token_mlp" in targets["modules_to_save"]
 
 
 def test_lambda_ema_updates_execution_horizon_on_policy_shell():

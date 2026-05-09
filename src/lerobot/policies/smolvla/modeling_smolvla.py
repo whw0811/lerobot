@@ -566,7 +566,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": ["lambda_head", "lambda_token_mlp"],
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -873,7 +873,9 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         if self.config.lambda_conditioning and lambda_cond is not None:
-            lambda_token = self.lambda_token_mlp(lambda_cond[:, None].to(device=device, dtype=dtype))[:, None, :]
+            lambda_token = self.lambda_token_mlp(lambda_cond[:, None].to(device=device, dtype=dtype))[
+                :, None, :
+            ]
             embs.append(lambda_token)
             pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
             att_masks += [1]
