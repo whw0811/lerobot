@@ -14,17 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
+    ComplementaryDataProcessorStep,
     DeviceProcessorStep,
     NewLineTaskProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
@@ -34,6 +38,35 @@ from lerobot.processor import (
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_smolvla import SmolVLAConfig
+from .lambda_labels import LambdaLabelLookup, load_lambda_sidecar
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="smolvla_lambda_label_processor")
+class SmolVLALambdaLabelProcessorStep(ComplementaryDataProcessorStep):
+    labels_path: str
+    default_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._lookup = LambdaLabelLookup(load_lambda_sidecar(Path(self.labels_path)), self.default_value)
+
+    def complementary_data(self, complementary_data: dict[str, Any]) -> dict[str, Any]:
+        if "index" not in complementary_data:
+            complementary_data["lambda_t"] = torch.tensor(self.default_value, dtype=torch.float32)
+            complementary_data["lambda_is_valid"] = torch.tensor(False, dtype=torch.bool)
+            return complementary_data
+
+        index = torch.as_tensor(complementary_data["index"], dtype=torch.long)
+        lambda_t, lambda_is_valid = self._lookup.lookup(index)
+        complementary_data["lambda_t"] = lambda_t
+        complementary_data["lambda_is_valid"] = lambda_is_valid
+        return complementary_data
+
+    def get_config(self) -> dict[str, Any]:
+        return {"labels_path": self.labels_path, "default_value": self.default_value}
+
+    def transform_features(self, features):
+        return features
 
 
 def make_smolvla_pre_post_processors(
@@ -70,19 +103,30 @@ def make_smolvla_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
         NewLineTaskProcessorStep(),
-        TokenizerProcessorStep(
-            tokenizer_name=config.vlm_model_name,
-            padding=config.pad_language_to,
-            padding_side="right",
-            max_length=config.tokenizer_max_length,
-        ),
-        DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
     ]
+    if config.lambda_labels_path is not None:
+        input_steps.append(
+            SmolVLALambdaLabelProcessorStep(
+                labels_path=config.lambda_labels_path,
+                default_value=config.lambda_default_value,
+            )
+        )
+    input_steps.extend(
+        [
+            TokenizerProcessorStep(
+                tokenizer_name=config.vlm_model_name,
+                padding=config.pad_language_to,
+                padding_side="right",
+                max_length=config.tokenizer_max_length,
+            ),
+            DeviceProcessorStep(device=config.device),
+            NormalizerProcessorStep(
+                features={**config.input_features, **config.output_features},
+                norm_map=config.normalization_mapping,
+                stats=dataset_stats,
+            ),
+        ]
+    )
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats

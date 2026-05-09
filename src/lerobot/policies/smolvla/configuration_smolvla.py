@@ -103,6 +103,22 @@ class SmolVLAConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Lambda residual-refinement labels and conditioning
+    lambda_labels_path: str | None = None
+    lambda_loss_weight: float = 0.05
+    lambda_loss_type: str = "smooth_l1"
+    lambda_conditioning: bool = True
+    lambda_alpha_start: float = 0.0
+    lambda_alpha_end: float = 1.0
+    lambda_alpha_warmup_steps: int = 30_000
+    lambda_default_value: float = 0.0
+
+    # Dynamic closed-loop execution from predicted lambda
+    dynamic_n_action_steps: bool = False
+    dynamic_n_action_steps_min: int = 3
+    dynamic_n_action_steps_max: int = 10
+    lambda_ema_beta: float = 0.8
+
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
@@ -119,6 +135,26 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.lambda_loss_weight < 0:
+            raise ValueError("lambda_loss_weight must be non-negative")
+        if self.lambda_loss_type not in {"smooth_l1", "mse"}:
+            raise ValueError("lambda_loss_type must be 'smooth_l1' or 'mse'")
+        if not 0.0 <= self.lambda_alpha_start <= 1.0:
+            raise ValueError("lambda_alpha_start must be in [0, 1]")
+        if not 0.0 <= self.lambda_alpha_end <= 1.0:
+            raise ValueError("lambda_alpha_end must be in [0, 1]")
+        if self.lambda_alpha_warmup_steps < 0:
+            raise ValueError("lambda_alpha_warmup_steps must be non-negative")
+        if not 0.0 <= self.lambda_default_value <= 1.0:
+            raise ValueError("lambda_default_value must be in [0, 1]")
+        if self.dynamic_n_action_steps_min <= 0:
+            raise ValueError("dynamic_n_action_steps_min must be positive")
+        if self.dynamic_n_action_steps_max < self.dynamic_n_action_steps_min:
+            raise ValueError("dynamic_n_action_steps_max must be >= dynamic_n_action_steps_min")
+        if self.dynamic_n_action_steps_max > self.chunk_size:
+            raise ValueError("dynamic_n_action_steps_max must be <= chunk_size")
+        if not 0.0 <= self.lambda_ema_beta < 1.0:
+            raise ValueError("lambda_ema_beta must be in [0, 1)")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

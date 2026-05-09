@@ -358,6 +358,39 @@ def test_smolvla_processor_without_stats():
     assert postprocessor is not None
 
 
+def test_smolvla_preprocessor_injects_lambda_labels_from_sidecar(tmp_path):
+    config = create_default_config()
+    config.lambda_labels_path = str(tmp_path / "labels.pt")
+    config.lambda_default_value = 0.1
+    stats = create_default_stats()
+    torch.save(
+        {
+            "valid_indices": torch.tensor([5]),
+            "lambda_t": torch.tensor([0.35]),
+            "metrics": {},
+            "metadata": {},
+        },
+        config.lambda_labels_path,
+    )
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, _ = make_smolvla_pre_post_processors(config, stats)
+
+    batch = {
+        OBS_STATE: torch.randn(2, 8),
+        OBS_IMAGE: torch.randn(2, 3, 224, 224),
+        ACTION: torch.randn(2, 7),
+        "task": ["pick", "place"],
+        "index": torch.tensor([5, 6]),
+    }
+    processed = preprocessor(batch)
+
+    assert torch.allclose(processed["lambda_t"], torch.tensor([0.35, 0.1]))
+    assert torch.equal(processed["lambda_is_valid"], torch.tensor([True, False]))
+
+
 def test_smolvla_newline_processor_state_dict():
     """Test NewLineTaskProcessorStep state dict methods."""
     processor = NewLineTaskProcessorStep()
