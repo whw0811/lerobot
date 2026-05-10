@@ -170,3 +170,34 @@ def test_delta_column_cache_preserves_episode_filter_indices(tmp_path, empty_ler
 
     assert item["observation.state"].tolist() == [11.0, 12.0]
     assert item["observation.state_is_pad"].tolist() == [False, False]
+
+
+def test_image_cache_serves_image_delta_queries(tmp_path, lerobot_dataset_factory, monkeypatch):
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds",
+        total_episodes=1,
+        total_frames=6,
+        use_videos=False,
+        delta_timestamps=None,
+    )
+    image_key = dataset.meta.image_keys[0]
+    loaded = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        delta_timestamps={image_key: [0.0]},
+        tolerance_s=0.04,
+        download_videos=False,
+    )
+    calls = {"count": 0}
+
+    def counted_get_many(key, relative_indices):
+        calls["count"] += 1
+        return torch.stack([loaded.reader._image_cache.get(key, idx) for idx in relative_indices])
+
+    monkeypatch.setattr(loaded.reader._image_cache, "get_many", counted_get_many, raising=False)
+
+    item = loaded[0]
+
+    assert calls["count"] == 1
+    assert item[image_key].shape[0] == 1
+    assert item[image_key].shape[1] == 3

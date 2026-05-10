@@ -250,6 +250,9 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
+            if self._image_cache is not None and key in self._meta.image_keys:
+                result[key] = self._image_cache.get_many(key, relative_indices)
+                continue
             if self._delta_column_cache is not None:
                 cached = self._delta_column_cache.get(key, relative_indices)
                 if cached is not None:

@@ -133,6 +133,9 @@ class ImageMemmapCache:
             return tensor
         return tensor.float().div(255.0)
 
+    def get_many(self, key: str, relative_indices: list[int]) -> torch.Tensor:
+        return torch.stack([self.get(key, idx) for idx in relative_indices])
+
     def _paths(self, key: str) -> tuple[Path, Path]:
         safe = safe_cache_key(key)
         return self.cache_dir / f"{safe}.uint8_chw.memmap", self.cache_dir / f"{safe}.manifest.json"
