@@ -15,6 +15,8 @@
 # limitations under the License.
 """Contract tests for DatasetReader."""
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
@@ -158,7 +160,7 @@ def test_get_episodes_file_paths_returns_data_paths(tmp_path, lerobot_dataset_fa
     paths = dataset.reader.get_episodes_file_paths()
 
     assert len(paths) > 0
-    assert any("data/" in str(p) for p in paths)
+    assert any(Path(p).parts[0] == "data" for p in paths)
 
 
 def test_get_episodes_file_paths_includes_video_paths(tmp_path, lerobot_dataset_factory):
