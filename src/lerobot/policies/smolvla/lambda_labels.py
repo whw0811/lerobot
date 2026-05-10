@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
-from torch import Tensor, nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch import Tensor
 
 from lerobot.configs.types import NormalizationMode
 from lerobot.utils.constants import ACTION
@@ -41,46 +41,24 @@ class LambdaLabelConfig:
 
 
 class LambdaMetrics(NamedTuple):
-    a_hat: Tensor
-    e_trend: Tensor
-    e_full: Tensor
-    e_improve: Tensor
+    pchip_error: Tensor
+    lambda_raw: Tensor
     lambda_t: Tensor
+    q_low_value: Tensor
+    q_high_value: Tensor
 
 
 class ActionChunkBatch(NamedTuple):
     indices: Tensor
+    episode_indices: Tensor
     chunks: Tensor
 
 
-@dataclass
-class ResidualTrainingConfig:
-    epochs: int = 10
-    batch_size: int = 256
-    lr: float = 1e-3
-    hidden_dim: int = 256
-    device: str = "cpu"
-
-
-class MaskedResidualPredictor(nn.Module):
-    def __init__(self, chunk_size: int, action_dim: int, num_query_positions: int, hidden_dim: int = 256):
-        super().__init__()
-        self.chunk_size = chunk_size
-        self.action_dim = action_dim
-        self.num_query_positions = num_query_positions
-        self.net = nn.Sequential(
-            nn.Linear(chunk_size * action_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, num_query_positions * action_dim),
-        )
-
-    def forward(self, trend: Tensor) -> Tensor:
-        if trend.ndim != 3:
-            raise ValueError("trend must have shape [N, chunk_size, action_dim]")
-        out = self.net(trend.flatten(start_dim=1))
-        return out.view(trend.shape[0], self.num_query_positions, self.action_dim)
+class PreloadedActionColumns(NamedTuple):
+    indices: Tensor
+    episode_indices: Tensor
+    actions: Tensor
+    row_by_index: dict[int, int]
 
 
 def compute_pchip_trend(action_chunks: Tensor, cfg: LambdaLabelConfig) -> Tensor:
@@ -115,34 +93,90 @@ def compute_pchip_trend(action_chunks: Tensor, cfg: LambdaLabelConfig) -> Tensor
     return trend.squeeze(0) if input_was_unbatched else trend
 
 
-def scatter_query_residuals(query_residuals: Tensor, action_dim: int, cfg: LambdaLabelConfig) -> Tensor:
-    if query_residuals.ndim != 3:
-        raise ValueError("query_residuals must have shape [N, len(query_indices), D]")
-    if query_residuals.shape[1] != len(cfg.query_indices):
-        raise ValueError("query_residuals second dimension must match query_indices")
-    if query_residuals.shape[2] != action_dim:
-        raise ValueError("query_residuals action dimension must match action_dim")
-
-    residuals = query_residuals.new_zeros(query_residuals.shape[0], cfg.chunk_size, action_dim)
-    residuals[:, list(cfg.query_indices), :] = query_residuals
-    return residuals
+def _validate_quantile_range(q_low: float, q_high: float) -> None:
+    if not 0.0 <= q_low < q_high <= 1.0:
+        raise ValueError("q_low and q_high must satisfy 0 <= q_low < q_high <= 1")
 
 
-def compute_lambda_metrics(
-    a_t: Tensor, a_trend: Tensor, a_residual: Tensor, cfg: LambdaLabelConfig
+def _normalize_by_quantiles(values: Tensor, q_low: float, q_high: float, eps: float) -> tuple[Tensor, Tensor, Tensor]:
+    _validate_quantile_range(q_low, q_high)
+    values_f32 = values.float()
+    q_low_value = torch.quantile(values_f32, q_low)
+    q_high_value = torch.quantile(values_f32, q_high)
+    denom = torch.clamp(q_high_value - q_low_value, min=eps)
+    normalized = torch.clamp((values_f32 - q_low_value) / denom, min=0.0, max=1.0)
+    return normalized.to(dtype=values.dtype), q_low_value, q_high_value
+
+
+def _smooth_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) -> Tensor:
+    if values.ndim != 1 or episode_indices.ndim != 1:
+        raise ValueError("values and episode_indices must be 1D tensors")
+    if values.numel() != episode_indices.numel():
+        raise ValueError("values and episode_indices must have the same length")
+    if window <= 0:
+        raise ValueError("smoothing_window must be positive")
+    if window == 1 or values.numel() == 0:
+        return values.clone()
+
+    smoothed = torch.empty_like(values)
+    left = (window - 1) // 2
+    right = window // 2
+    for episode_index in torch.unique(episode_indices, sorted=True):
+        positions = torch.nonzero(episode_indices == episode_index, as_tuple=False).flatten()
+        episode_values = values[positions]
+        for row in range(episode_values.numel()):
+            start = max(0, row - left)
+            end = min(episode_values.numel(), row + right + 1)
+            smoothed[positions[row]] = episode_values[start:end].mean()
+    return smoothed
+
+
+def compute_pchip_error_lambda_metrics(
+    chunks: Tensor,
+    episode_indices: Tensor,
+    cfg: LambdaLabelConfig,
+    q_low: float = 0.05,
+    q_high: float = 0.95,
+    smoothing_window: int = 11,
+    smoothing_alpha: float = 0.7,
 ) -> LambdaMetrics:
-    if a_t.shape != a_trend.shape or a_t.shape != a_residual.shape:
-        raise ValueError("a_t, a_trend, and a_residual must have identical shapes")
-    if a_t.ndim != 3 or a_t.shape[1] != cfg.chunk_size:
-        raise ValueError(f"Expected tensors shaped [N, {cfg.chunk_size}, D]")
+    if chunks.ndim != 3 or chunks.shape[1] != cfg.chunk_size:
+        raise ValueError(f"Expected chunks shaped [N, {cfg.chunk_size}, D]")
+    if not 0.0 <= smoothing_alpha <= 1.0:
+        raise ValueError("smoothing_alpha must be in [0, 1]")
 
-    a_hat = a_trend + a_residual
+    episode_indices = torch.as_tensor(episode_indices, dtype=torch.long, device=chunks.device).view(-1)
+    if episode_indices.numel() != chunks.shape[0]:
+        raise ValueError("episode_indices must have one value per chunk")
+
+    trend = compute_pchip_trend(chunks, cfg)
     query = list(cfg.query_indices)
-    e_trend = (a_t[:, query, :] - a_trend[:, query, :]).pow(2).mean(dim=(1, 2))
-    e_full = (a_t[:, query, :] - a_hat[:, query, :]).pow(2).mean(dim=(1, 2))
-    e_improve = e_trend - e_full
-    lambda_t = torch.clamp(e_improve / (e_trend + cfg.eps), min=0.0, max=1.0)
-    return LambdaMetrics(a_hat=a_hat, e_trend=e_trend, e_full=e_full, e_improve=e_improve, lambda_t=lambda_t)
+    pchip_error = (chunks[:, query] - trend[:, query]).pow(2).mean(dim=(1, 2))
+    lambda_raw, q_low_value, q_high_value = _normalize_by_quantiles(
+        pchip_error, q_low=q_low, q_high=q_high, eps=cfg.eps
+    )
+    smoothed = _smooth_1d_by_episode(lambda_raw, episode_indices, smoothing_window)
+    lambda_t = torch.clamp(smoothing_alpha * smoothed + (1.0 - smoothing_alpha) * lambda_raw, 0.0, 1.0)
+    return LambdaMetrics(
+        pchip_error=pchip_error,
+        lambda_raw=lambda_raw,
+        lambda_t=lambda_t,
+        q_low_value=q_low_value,
+        q_high_value=q_high_value,
+    )
+
+
+def _summarize_lambda_metrics(metrics: LambdaMetrics) -> dict[str, Tensor]:
+    return {
+        "pchip_error_mean": metrics.pchip_error.mean().detach(),
+        "pchip_error_std": metrics.pchip_error.std(unbiased=False).detach(),
+        "lambda_raw_mean": metrics.lambda_raw.mean().detach(),
+        "lambda_raw_std": metrics.lambda_raw.std(unbiased=False).detach(),
+        "lambda_t_mean": metrics.lambda_t.mean().detach(),
+        "lambda_t_std": metrics.lambda_t.std(unbiased=False).detach(),
+        "q_low_value": metrics.q_low_value.detach(),
+        "q_high_value": metrics.q_high_value.detach(),
+    }
 
 
 def normalize_action_chunks(
@@ -189,22 +223,15 @@ def save_lambda_sidecar(
     lambda_t: Tensor,
     metrics: dict[str, Tensor],
     metadata: dict[str, Any],
-    diagnostics: dict[str, Tensor] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "valid_indices": valid_indices.detach().cpu().to(dtype=torch.long),
         "lambda_t": lambda_t.detach().cpu().to(dtype=torch.float32),
-        "metrics": {key: value.detach().cpu() for key, value in metrics.items()},
+        "metrics": {key: torch.as_tensor(value).detach().cpu() for key, value in metrics.items()},
         "metadata": metadata,
     }
-    payload["lambda_by_index"] = {
-        int(idx): float(value)
-        for idx, value in zip(payload["valid_indices"].tolist(), payload["lambda_t"].tolist(), strict=True)
-    }
-    if diagnostics is not None:
-        payload["diagnostics"] = {key: value.detach().cpu() for key, value in diagnostics.items()}
     torch.save(payload, path)
 
 
@@ -212,6 +239,8 @@ def load_lambda_sidecar(path: str | Path) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if "valid_indices" not in payload or "lambda_t" not in payload:
         raise ValueError("Lambda sidecar must contain valid_indices and lambda_t")
+    payload.pop("lambda_by_index", None)
+    payload.pop("diagnostics", None)
     return payload
 
 
@@ -220,19 +249,31 @@ class LambdaLabelLookup:
         self.default_value = float(default_value)
         indices = torch.as_tensor(payload["valid_indices"], dtype=torch.long)
         values = torch.as_tensor(payload["lambda_t"], dtype=torch.float32)
-        self._values_by_index = {
-            int(idx): float(value) for idx, value in zip(indices.tolist(), values.tolist(), strict=True)
-        }
+        if indices.ndim != 1 or values.ndim != 1:
+            raise ValueError("Lambda sidecar valid_indices and lambda_t must be 1D tensors")
+        if indices.numel() != values.numel():
+            raise ValueError("Lambda sidecar valid_indices and lambda_t must have the same length")
+
+        order = torch.argsort(indices)
+        self._indices = indices[order].cpu()
+        self._values = values[order].cpu()
+        if self._indices.numel() > 1 and torch.any(self._indices[1:] == self._indices[:-1]):
+            raise ValueError("Lambda sidecar valid_indices must be unique")
 
     def lookup(self, indices: Tensor) -> tuple[Tensor, Tensor]:
-        flat_indices = torch.as_tensor(indices, dtype=torch.long).view(-1).cpu()
+        indices_tensor = torch.as_tensor(indices, dtype=torch.long)
+        flat_indices = indices_tensor.view(-1).cpu()
         values = torch.full((flat_indices.numel(),), self.default_value, dtype=torch.float32)
         valid = torch.zeros((flat_indices.numel(),), dtype=torch.bool)
-        for row, idx in enumerate(flat_indices.tolist()):
-            if idx in self._values_by_index:
-                values[row] = self._values_by_index[idx]
-                valid[row] = True
-        return values.view(indices.shape), valid.view(indices.shape)
+        if self._indices.numel() == 0:
+            return values.view(indices_tensor.shape), valid.view(indices_tensor.shape)
+
+        positions = torch.searchsorted(self._indices, flat_indices)
+        in_bounds = positions < self._indices.numel()
+        safe_positions = positions.clamp(max=self._indices.numel() - 1)
+        valid = in_bounds & (self._indices[safe_positions] == flat_indices)
+        values[valid] = self._values[safe_positions[valid]]
+        return values.view(indices_tensor.shape), valid.view(indices_tensor.shape)
 
 
 def _episode_value(episode: dict[str, Any], key: str) -> int:
@@ -244,8 +285,39 @@ def _episode_value(episode: dict[str, Any], key: str) -> int:
     return int(value)
 
 
+def _stack_action_column(values: Any) -> Tensor:
+    tensors = [torch.as_tensor(value, dtype=torch.float32) for value in values]
+    if not tensors:
+        return torch.empty((0,), dtype=torch.float32)
+    return torch.stack(tensors, dim=0)
+
+
+def _scalar_column_to_long(values: Any) -> Tensor:
+    return torch.tensor(
+        [int(value.item() if torch.is_tensor(value) else value) for value in values],
+        dtype=torch.long,
+    )
+
+
+def _preload_action_columns(dataset: Any) -> PreloadedActionColumns:
+    action_dataset = dataset.select_columns([ACTION, "index", "episode_index"])
+    actions = _stack_action_column(action_dataset[ACTION])
+    indices = _scalar_column_to_long(action_dataset["index"])
+    episode_indices = _scalar_column_to_long(action_dataset["episode_index"])
+    if not (actions.shape[0] == indices.numel() == episode_indices.numel()):
+        raise ValueError("Preloaded action columns have inconsistent lengths")
+    return PreloadedActionColumns(
+        indices=indices,
+        episode_indices=episode_indices,
+        actions=actions,
+        row_by_index={int(index): row for row, index in enumerate(indices.tolist())},
+    )
+
+
 def extract_action_chunks_from_dataset(dataset: Any, cfg: LambdaLabelConfig) -> ActionChunkBatch:
+    action_columns = _preload_action_columns(dataset)
     indices: list[int] = []
+    chunk_episode_indices: list[int] = []
     chunks: list[Tensor] = []
     for ep_idx in range(dataset.num_episodes):
         ep = dataset.meta.episodes[ep_idx]
@@ -254,6 +326,7 @@ def extract_action_chunks_from_dataset(dataset: Any, cfg: LambdaLabelConfig) -> 
         if to_idx - from_idx < cfg.chunk_size:
             continue
         episode_actions: list[Tensor] = []
+        episode_start_indices: list[int] = []
         episode_indices: list[int] = []
         for abs_idx in range(from_idx, to_idx):
             if dataset.reader._absolute_to_relative_idx is not None:
@@ -261,115 +334,114 @@ def extract_action_chunks_from_dataset(dataset: Any, cfg: LambdaLabelConfig) -> 
                 if rel_idx is None:
                     break
             else:
-                rel_idx = abs_idx
-            frame = dataset.get_raw_item(rel_idx)
-            episode_indices.append(int(torch.as_tensor(frame["index"]).item()))
-            episode_actions.append(torch.as_tensor(frame[ACTION], dtype=torch.float32))
+                rel_idx = action_columns.row_by_index.get(abs_idx)
+                if rel_idx is None:
+                    break
+            episode_start_indices.append(int(action_columns.indices[rel_idx].item()))
+            episode_indices.append(int(action_columns.episode_indices[rel_idx].item()))
+            episode_actions.append(action_columns.actions[rel_idx])
         if len(episode_actions) < cfg.chunk_size:
             continue
         actions = torch.stack(episode_actions, dim=0)
         for start in range(0, actions.shape[0] - cfg.chunk_size + 1):
-            indices.append(episode_indices[start])
+            indices.append(episode_start_indices[start])
+            chunk_episode_indices.append(episode_indices[start])
             chunks.append(actions[start : start + cfg.chunk_size])
     if not chunks:
         raise ValueError("No valid action chunks were found in the dataset")
     return ActionChunkBatch(
-        indices=torch.tensor(indices, dtype=torch.long), chunks=torch.stack(chunks, dim=0)
+        indices=torch.tensor(indices, dtype=torch.long),
+        episode_indices=torch.tensor(chunk_episode_indices, dtype=torch.long),
+        chunks=torch.stack(chunks, dim=0),
     )
-
-
-def train_residual_predictor(
-    normalized_chunks: Tensor,
-    cfg: LambdaLabelConfig,
-    train_cfg: ResidualTrainingConfig,
-) -> MaskedResidualPredictor:
-    trend = compute_pchip_trend(normalized_chunks, cfg)
-    target = normalized_chunks[:, list(cfg.query_indices), :] - trend[:, list(cfg.query_indices), :]
-    predictor = MaskedResidualPredictor(
-        chunk_size=cfg.chunk_size,
-        action_dim=normalized_chunks.shape[-1],
-        num_query_positions=len(cfg.query_indices),
-        hidden_dim=train_cfg.hidden_dim,
-    ).to(train_cfg.device)
-    dataset = TensorDataset(trend.to(torch.float32), target.to(torch.float32))
-    loader = DataLoader(dataset, batch_size=train_cfg.batch_size, shuffle=True)
-    optimizer = torch.optim.AdamW(predictor.parameters(), lr=train_cfg.lr)
-    predictor.train()
-    for _epoch in range(train_cfg.epochs):
-        for batch_trend, batch_target in loader:
-            batch_trend = batch_trend.to(train_cfg.device)
-            batch_target = batch_target.to(train_cfg.device)
-            pred = predictor(batch_trend)
-            loss = torch.nn.functional.mse_loss(pred, batch_target)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-    predictor.eval()
-    return predictor
 
 
 @torch.no_grad()
 def generate_lambda_labels_from_chunks(
     chunks: Tensor,
     indices: Tensor,
-    predictor: nn.Module,
+    episode_indices: Tensor,
     cfg: LambdaLabelConfig,
-    batch_size: int = 256,
-    save_diagnostics: bool = False,
-    max_diagnostic_chunks: int | None = None,
+    q_low: float = 0.05,
+    q_high: float = 0.95,
+    smoothing_window: int = 11,
+    smoothing_alpha: float = 0.7,
 ) -> dict[str, Any]:
-    predictor.eval()
-    trend = compute_pchip_trend(chunks, cfg)
-    residual_batches: list[Tensor] = []
-    try:
-        device = next(predictor.parameters()).device
-    except StopIteration:
-        device = torch.device("cpu")
-    for start in range(0, chunks.shape[0], batch_size):
-        batch_trend = trend[start : start + batch_size].to(device)
-        query_residuals = predictor(batch_trend).cpu()
-        residual_batches.append(scatter_query_residuals(query_residuals, chunks.shape[-1], cfg))
-    residuals = torch.cat(residual_batches, dim=0).to(dtype=chunks.dtype)
-    metrics = compute_lambda_metrics(chunks, trend, residuals, cfg)
-    payload: dict[str, Any] = {
-        "valid_indices": indices.detach().cpu().to(dtype=torch.long),
+    indices = torch.as_tensor(indices, dtype=torch.long).view(-1)
+    episode_indices = torch.as_tensor(episode_indices, dtype=torch.long).view(-1)
+    if chunks.shape[0] != indices.numel() or chunks.shape[0] != episode_indices.numel():
+        raise ValueError("chunks, indices, and episode_indices must have matching first dimensions")
+
+    metrics = compute_pchip_error_lambda_metrics(
+        chunks=chunks,
+        episode_indices=episode_indices,
+        cfg=cfg,
+        q_low=q_low,
+        q_high=q_high,
+        smoothing_window=smoothing_window,
+        smoothing_alpha=smoothing_alpha,
+    )
+    return {
+        "valid_indices": indices.detach().cpu(),
         "lambda_t": metrics.lambda_t.detach().cpu().to(dtype=torch.float32),
-        "metrics": {
-            "e_trend": metrics.e_trend.detach().cpu(),
-            "e_full": metrics.e_full.detach().cpu(),
-            "e_improve": metrics.e_improve.detach().cpu(),
-        },
+        "metrics": _summarize_lambda_metrics(metrics),
+        "pchip_error": metrics.pchip_error.detach().cpu().to(dtype=torch.float32),
+        "lambda_raw": metrics.lambda_raw.detach().cpu().to(dtype=torch.float32),
     }
-    if save_diagnostics:
-        limit = (
-            chunks.shape[0] if max_diagnostic_chunks is None else min(max_diagnostic_chunks, chunks.shape[0])
+
+
+def _format_csv_float(value: Tensor | float) -> str:
+    return str(round(float(value), 6))
+
+
+def save_lambda_diagnostics_csv(
+    path: str | Path,
+    indices: Tensor,
+    episode_indices: Tensor,
+    pchip_error: Tensor,
+    lambda_raw: Tensor,
+    lambda_t: Tensor,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = zip(
+        torch.as_tensor(indices, dtype=torch.long).view(-1).tolist(),
+        torch.as_tensor(episode_indices, dtype=torch.long).view(-1).tolist(),
+        torch.as_tensor(pchip_error, dtype=torch.float32).view(-1),
+        torch.as_tensor(lambda_raw, dtype=torch.float32).view(-1),
+        torch.as_tensor(lambda_t, dtype=torch.float32).view(-1),
+        strict=True,
+    )
+    with path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=["index", "episode_index", "pchip_error", "lambda_raw", "lambda_t"],
         )
-        payload["diagnostics"] = {
-            "A_t": chunks[:limit].detach().cpu(),
-            "A_trend": trend[:limit].detach().cpu(),
-            "A_residual": residuals[:limit].detach().cpu(),
-            "A_hat": metrics.a_hat[:limit].detach().cpu(),
-        }
-    return payload
+        writer.writeheader()
+        for index, episode_index, error, raw_value, value in rows:
+            writer.writerow(
+                {
+                    "index": int(index),
+                    "episode_index": int(episode_index),
+                    "pchip_error": _format_csv_float(error),
+                    "lambda_raw": _format_csv_float(raw_value),
+                    "lambda_t": _format_csv_float(value),
+                }
+            )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Train SmolVLA residual predictor and generate lambda labels."
-    )
+    parser = argparse.ArgumentParser(description="Generate SmolVLA PCHIP error lambda labels.")
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--root", default=None)
     parser.add_argument("--revision", default=None)
     parser.add_argument("--output-path", required=True)
-    parser.add_argument("--checkpoint-path", default=None)
     parser.add_argument("--normalization-mode", default=NormalizationMode.MEAN_STD.value)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--save-diagnostics", action="store_true")
-    parser.add_argument("--max-diagnostic-chunks", type=int, default=128)
+    parser.add_argument("--lambda-error-q-low", type=float, default=0.05)
+    parser.add_argument("--lambda-error-q-high", type=float, default=0.95)
+    parser.add_argument("--lambda-smoothing-window", type=int, default=11)
+    parser.add_argument("--lambda-smoothing-alpha", type=float, default=0.7)
+    parser.add_argument("--diagnostics-path", default=None)
     return parser
 
 
@@ -383,39 +455,30 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
     normalized_chunks = normalize_action_chunks(
         chunk_batch.chunks, dataset.meta.stats[ACTION], action_norm_mode
     )
-    train_cfg = ResidualTrainingConfig(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        hidden_dim=args.hidden_dim,
-        device=args.device,
-    )
-    predictor = train_residual_predictor(normalized_chunks, cfg, train_cfg)
-    if args.checkpoint_path is not None:
-        checkpoint_path = Path(args.checkpoint_path)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"model_state_dict": predictor.state_dict(), "config": train_cfg.__dict__}, checkpoint_path
-        )
     labels = generate_lambda_labels_from_chunks(
         chunks=normalized_chunks,
         indices=chunk_batch.indices,
-        predictor=predictor,
+        episode_indices=chunk_batch.episode_indices,
         cfg=cfg,
-        batch_size=args.batch_size,
-        save_diagnostics=args.save_diagnostics,
-        max_diagnostic_chunks=args.max_diagnostic_chunks,
+        q_low=args.lambda_error_q_low,
+        q_high=args.lambda_error_q_high,
+        smoothing_window=args.lambda_smoothing_window,
+        smoothing_alpha=args.lambda_smoothing_alpha,
     )
     metadata = {
         "repo_id": args.repo_id,
         "root": args.root,
         "revision": args.revision,
         "created_at": datetime.now(UTC).isoformat(),
+        "method": "pchip_error",
         "chunk_size": cfg.chunk_size,
         "anchor_indices": list(cfg.anchor_indices),
         "query_indices": list(cfg.query_indices),
         "normalization_mode": action_norm_mode.value,
-        "checkpoint_path": args.checkpoint_path,
+        "lambda_error_q_low": args.lambda_error_q_low,
+        "lambda_error_q_high": args.lambda_error_q_high,
+        "lambda_smoothing_window": args.lambda_smoothing_window,
+        "lambda_smoothing_alpha": args.lambda_smoothing_alpha,
     }
     save_lambda_sidecar(
         path=args.output_path,
@@ -423,8 +486,16 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         lambda_t=labels["lambda_t"],
         metrics=labels["metrics"],
         metadata=metadata,
-        diagnostics=labels.get("diagnostics"),
     )
+    if args.diagnostics_path is not None:
+        save_lambda_diagnostics_csv(
+            path=args.diagnostics_path,
+            indices=labels["valid_indices"],
+            episode_indices=chunk_batch.episode_indices,
+            pchip_error=labels["pchip_error"],
+            lambda_raw=labels["lambda_raw"],
+            lambda_t=labels["lambda_t"],
+        )
 
 
 def main() -> None:

@@ -38,6 +38,11 @@ class DatasetConfig:
     # When True, video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
+    # When True, image-backed observations are materialized into a local uint8 memmap cache under
+    # dataset.root/image_cache on first access. Disabled by default to avoid surprise disk writes.
+    use_image_cache: bool = False
+    image_cache_dir: str | None = None
+    build_image_cache: bool = True
     streaming: bool = False
 
     def __post_init__(self) -> None:

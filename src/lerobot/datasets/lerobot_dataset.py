@@ -57,6 +57,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         return_uint8: bool = False,
+        use_image_cache: bool = False,
+        image_cache_dir: str | Path | None = None,
+        build_image_cache: bool = True,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         streaming_encoding: bool = False,
@@ -175,6 +178,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            use_image_cache (bool, optional): If True, image-backed observations are cached as local
+                uint8 memmaps under ``root / "image_cache"`` on first access. Defaults to False.
+            image_cache_dir (str | Path | None, optional): Directory used for image cache files. Defaults
+                to ``root / "image_cache"`` when image caching is enabled.
+            build_image_cache (bool, optional): If True, build the image cache when it is missing or stale.
+                Defaults to True.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
             vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
@@ -204,6 +213,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_codec()
         self._return_uint8 = return_uint8
+        self._use_image_cache = use_image_cache
+        self._image_cache_dir = image_cache_dir
+        self._build_image_cache = build_image_cache
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
@@ -228,6 +240,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
+            use_image_cache=self._use_image_cache,
+            image_cache_dir=self._image_cache_dir,
+            build_image_cache=self._build_image_cache,
         )
 
         # Load actual data
@@ -292,6 +307,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
+                use_image_cache=self._use_image_cache,
+                image_cache_dir=self._image_cache_dir,
+                build_image_cache=self._build_image_cache,
             )
         return self.reader
 
@@ -692,6 +710,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         obj._return_uint8 = False
+        obj._use_image_cache = False
+        obj._image_cache_dir = None
+        obj._build_image_cache = True
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
@@ -785,6 +806,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend else get_safe_default_codec()
         obj._return_uint8 = False
+        obj._use_image_cache = False
+        obj._image_cache_dir = None
+        obj._build_image_cache = True
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads

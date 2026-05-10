@@ -126,6 +126,8 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.n_obs_steps <= 0:
+            raise ValueError(f"`n_obs_steps` must be positive, got {self.n_obs_steps}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -186,7 +188,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return [0]
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:
