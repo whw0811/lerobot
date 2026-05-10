@@ -22,6 +22,7 @@ from pathlib import Path
 import datasets
 import torch
 
+from .cache_utils import DeltaColumnCache, ImageMemmapCache
 from .dataset_metadata import LeRobotDatasetMetadata
 from .feature_utils import (
     check_delta_timestamps,
@@ -79,6 +80,8 @@ class DatasetReader:
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
+        self._image_cache: ImageMemmapCache | None = None
+        self._delta_column_cache: DeltaColumnCache | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -97,12 +100,14 @@ class DatasetReader:
             self.hf_dataset = None
             return False
         self._build_index_mapping()
+        self._init_read_caches()
         return True
 
     def load_and_activate(self) -> None:
         """Load HF dataset from disk and build index mapping. Call after data is on disk."""
         self.hf_dataset = self._load_hf_dataset()
         self._build_index_mapping()
+        self._init_read_caches()
 
     def _build_index_mapping(self) -> None:
         """Build absolute-to-relative index mapping from loaded hf_dataset."""
@@ -110,6 +115,27 @@ class DatasetReader:
         if self.episodes is not None and self.hf_dataset is not None:
             indices = self.hf_dataset.data.column("index").to_numpy()
             self._absolute_to_relative_idx = dict(zip(indices.tolist(), range(len(indices)), strict=True))
+
+    def _init_read_caches(self) -> None:
+        """Initialize read-side caches after the HF dataset is active."""
+        if self.hf_dataset is None:
+            self._image_cache = None
+            self._delta_column_cache = None
+            return
+
+        self._delta_column_cache = DeltaColumnCache(
+            self.hf_dataset,
+            self.delta_indices,
+            self._meta.features,
+            self._meta.camera_keys,
+        )
+        self._image_cache = ImageMemmapCache(
+            self.root,
+            self.hf_dataset,
+            self._meta.image_keys,
+            self._meta.features,
+            return_uint8=self._return_uint8,
+        )
 
     @property
     def num_frames(self) -> int:
@@ -269,6 +295,11 @@ class DatasetReader:
         column.  The absolute index is retrieved from the row itself.
         """
         item = self.hf_dataset[idx]
+        if self._image_cache is not None:
+            for image_key in self._meta.image_keys:
+                if image_key in item:
+                    item[image_key] = self._image_cache.get(image_key, idx)
+
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
