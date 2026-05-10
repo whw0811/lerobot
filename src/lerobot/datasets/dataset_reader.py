@@ -250,6 +250,11 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
+            if self._delta_column_cache is not None:
+                cached = self._delta_column_cache.get(key, relative_indices)
+                if cached is not None:
+                    result[key] = cached
+                    continue
             try:
                 result[key] = torch.stack(self.hf_dataset[key][relative_indices])
             except (KeyError, TypeError, IndexError):

@@ -101,3 +101,72 @@ def test_video_backed_dataset_does_not_create_image_memmap(tmp_path, lerobot_dat
 
     assert len(dataset.meta.image_keys) == 0
     assert not (dataset.root / "image_cache").exists()
+
+
+def test_delta_column_cache_serves_numeric_delta_queries(
+    tmp_path, empty_lerobot_dataset_factory, monkeypatch
+):
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]},
+        "action": {"dtype": "float32", "shape": (1,), "names": ["x"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features, use_videos=False, fps=10)
+    for frame_idx in range(5):
+        dataset.add_frame(
+            {
+                "observation.state": torch.tensor([frame_idx], dtype=torch.float32),
+                "action": torch.tensor([frame_idx + 100], dtype=torch.float32),
+                "task": "task",
+            }
+        )
+    dataset.save_episode()
+    dataset.finalize()
+
+    loaded = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        delta_timestamps={"observation.state": [-0.1, 0.0], "action": [0.0, 0.1]},
+        tolerance_s=0.04,
+    )
+    calls = {"count": 0}
+    original_get = loaded.reader._delta_column_cache.get
+
+    def counted_get(key, relative_indices):
+        calls["count"] += 1
+        return original_get(key, relative_indices)
+
+    monkeypatch.setattr(loaded.reader._delta_column_cache, "get", counted_get)
+
+    item = loaded[2]
+
+    assert calls["count"] == 2
+    assert item["observation.state"].tolist() == [1.0, 2.0]
+    assert item["action"].tolist() == [102.0, 103.0]
+
+
+def test_delta_column_cache_preserves_episode_filter_indices(tmp_path, empty_lerobot_dataset_factory):
+    features = {"observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features, use_videos=False, fps=10)
+    for ep_idx in range(3):
+        for frame_idx in range(5):
+            dataset.add_frame(
+                {
+                    "observation.state": torch.tensor([ep_idx * 10 + frame_idx], dtype=torch.float32),
+                    "task": f"task_{ep_idx}",
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+
+    loaded = LeRobotDataset(
+        dataset.repo_id,
+        root=dataset.root,
+        episodes=[1],
+        delta_timestamps={"observation.state": [-0.1, 0.0]},
+        tolerance_s=0.04,
+    )
+
+    item = loaded[2]
+
+    assert item["observation.state"].tolist() == [11.0, 12.0]
+    assert item["observation.state_is_pad"].tolist() == [False, False]
