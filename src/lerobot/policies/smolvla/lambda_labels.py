@@ -43,6 +43,7 @@ class LambdaLabelConfig:
 class LambdaMetrics(NamedTuple):
     pchip_error: Tensor
     lambda_raw: Tensor
+    lambda_envelope: Tensor
     lambda_t: Tensor
     q_low_value: Tensor
     q_high_value: Tensor
@@ -131,12 +132,36 @@ def _smooth_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) 
     return smoothed
 
 
+def _max_envelope_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) -> Tensor:
+    if values.ndim != 1 or episode_indices.ndim != 1:
+        raise ValueError("values and episode_indices must be 1D tensors")
+    if values.numel() != episode_indices.numel():
+        raise ValueError("values and episode_indices must have the same length")
+    if window <= 0:
+        raise ValueError("envelope_window must be positive")
+    if window == 1 or values.numel() == 0:
+        return values.clone()
+
+    envelope = torch.empty_like(values)
+    left = (window - 1) // 2
+    right = window // 2
+    for episode_index in torch.unique(episode_indices, sorted=True):
+        positions = torch.nonzero(episode_indices == episode_index, as_tuple=False).flatten()
+        episode_values = values[positions]
+        for row in range(episode_values.numel()):
+            start = max(0, row - left)
+            end = min(episode_values.numel(), row + right + 1)
+            envelope[positions[row]] = episode_values[start:end].max()
+    return envelope
+
+
 def compute_pchip_error_lambda_metrics(
     chunks: Tensor,
     episode_indices: Tensor,
     cfg: LambdaLabelConfig,
     q_low: float = 0.05,
     q_high: float = 0.95,
+    envelope_window: int = 5,
     smoothing_window: int = 11,
     smoothing_alpha: float = 0.7,
 ) -> LambdaMetrics:
@@ -155,11 +180,15 @@ def compute_pchip_error_lambda_metrics(
     lambda_raw, q_low_value, q_high_value = _normalize_by_quantiles(
         pchip_error, q_low=q_low, q_high=q_high, eps=cfg.eps
     )
-    smoothed = _smooth_1d_by_episode(lambda_raw, episode_indices, smoothing_window)
-    lambda_t = torch.clamp(smoothing_alpha * smoothed + (1.0 - smoothing_alpha) * lambda_raw, 0.0, 1.0)
+    lambda_envelope = _max_envelope_1d_by_episode(lambda_raw, episode_indices, envelope_window)
+    smoothed = _smooth_1d_by_episode(lambda_envelope, episode_indices, smoothing_window)
+    lambda_t = torch.clamp(
+        smoothing_alpha * smoothed + (1.0 - smoothing_alpha) * lambda_envelope, 0.0, 1.0
+    )
     return LambdaMetrics(
         pchip_error=pchip_error,
         lambda_raw=lambda_raw,
+        lambda_envelope=lambda_envelope,
         lambda_t=lambda_t,
         q_low_value=q_low_value,
         q_high_value=q_high_value,
@@ -172,6 +201,8 @@ def _summarize_lambda_metrics(metrics: LambdaMetrics) -> dict[str, Tensor]:
         "pchip_error_std": metrics.pchip_error.std(unbiased=False).detach(),
         "lambda_raw_mean": metrics.lambda_raw.mean().detach(),
         "lambda_raw_std": metrics.lambda_raw.std(unbiased=False).detach(),
+        "lambda_envelope_mean": metrics.lambda_envelope.mean().detach(),
+        "lambda_envelope_std": metrics.lambda_envelope.std(unbiased=False).detach(),
         "lambda_t_mean": metrics.lambda_t.mean().detach(),
         "lambda_t_std": metrics.lambda_t.std(unbiased=False).detach(),
         "q_low_value": metrics.q_low_value.detach(),
@@ -364,6 +395,7 @@ def generate_lambda_labels_from_chunks(
     cfg: LambdaLabelConfig,
     q_low: float = 0.05,
     q_high: float = 0.95,
+    envelope_window: int = 5,
     smoothing_window: int = 11,
     smoothing_alpha: float = 0.7,
 ) -> dict[str, Any]:
@@ -378,6 +410,7 @@ def generate_lambda_labels_from_chunks(
         cfg=cfg,
         q_low=q_low,
         q_high=q_high,
+        envelope_window=envelope_window,
         smoothing_window=smoothing_window,
         smoothing_alpha=smoothing_alpha,
     )
@@ -387,6 +420,7 @@ def generate_lambda_labels_from_chunks(
         "metrics": _summarize_lambda_metrics(metrics),
         "pchip_error": metrics.pchip_error.detach().cpu().to(dtype=torch.float32),
         "lambda_raw": metrics.lambda_raw.detach().cpu().to(dtype=torch.float32),
+        "lambda_envelope": metrics.lambda_envelope.detach().cpu().to(dtype=torch.float32),
     }
 
 
@@ -439,6 +473,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalization-mode", default=NormalizationMode.MEAN_STD.value)
     parser.add_argument("--lambda-error-q-low", type=float, default=0.05)
     parser.add_argument("--lambda-error-q-high", type=float, default=0.95)
+    parser.add_argument("--lambda-envelope-window", type=int, default=5)
     parser.add_argument("--lambda-smoothing-window", type=int, default=11)
     parser.add_argument("--lambda-smoothing-alpha", type=float, default=0.7)
     parser.add_argument("--diagnostics-path", default=None)
@@ -462,6 +497,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         cfg=cfg,
         q_low=args.lambda_error_q_low,
         q_high=args.lambda_error_q_high,
+        envelope_window=args.lambda_envelope_window,
         smoothing_window=args.lambda_smoothing_window,
         smoothing_alpha=args.lambda_smoothing_alpha,
     )
@@ -477,6 +513,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         "normalization_mode": action_norm_mode.value,
         "lambda_error_q_low": args.lambda_error_q_low,
         "lambda_error_q_high": args.lambda_error_q_high,
+        "lambda_envelope_window": args.lambda_envelope_window,
         "lambda_smoothing_window": args.lambda_smoothing_window,
         "lambda_smoothing_alpha": args.lambda_smoothing_alpha,
     }

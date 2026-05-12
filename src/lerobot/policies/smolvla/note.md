@@ -105,6 +105,7 @@ python -m lerobot.policies.smolvla.lambda_labels \
   --output-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
   --lambda-error-q-low=0.05 \
   --lambda-error-q-high=0.95 \
+  --lambda-envelope-window=5 \
   --lambda-smoothing-window=11 \
   --lambda-smoothing-alpha=0.7 \
   --diagnostics-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_diagnostics.csv
@@ -122,7 +123,7 @@ lerobot-train \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --dataset.root=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero \
   --batch_size=64 \
-  --num_workers=8 \
+  --num_workers=4 \
   --steps=100000 \
   --save_freq=5000 \
   --seed=42 \
@@ -133,15 +134,18 @@ lerobot-train \
   --output_dir=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda
 
 2.3 测试
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate lerobot
+
 lerobot-eval \
-  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda/100000 \
+  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda/1to50_dynamic_freq/100000 \
   --env.type=libero \
   --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
   --eval.batch_size=1 \
   --eval.n_episodes=10 \
-  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda/checkpoints/last/pretrained_model \
+  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda/checkpoints/100000/pretrained_model \
   --policy.n_action_steps=10 \
+  --seed=42 \
   --policy.dynamic_n_action_steps=true \
-  --policy.dynamic_n_action_steps_min=4 \
+  --policy.dynamic_n_action_steps_min=5 \
   --policy.dynamic_n_action_steps_max=10
-

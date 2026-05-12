@@ -497,13 +497,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
+            # Normalize from range [0,1] to [-1,1] as expected by SigLIP.
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
             device = img.device
             if f"{key}_padding_mask" in batch:
                 mask = batch[f"{key}_padding_mask"].bool()
+                mask = mask[:, -1] if mask.ndim > 1 else mask
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
             images.append(img)
@@ -549,7 +550,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        state = batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
