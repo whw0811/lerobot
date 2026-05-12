@@ -110,6 +110,15 @@ python -m lerobot.policies.smolvla.lambda_labels \
   --lambda-smoothing-alpha=0.7 \
   --diagnostics-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_diagnostics.csv
 
+python -m lerobot.policies.smolvla.lambda_label_viewer \
+  --repo-id=HuggingFaceVLA/libero \
+  --root=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero \
+  --labels-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
+  --episode=10 \
+  --fps=10 \
+  --output-video=/root/autodl-tmp/lambda_episode10.mp4
+
+
   2.2 正式训练
 lerobot-train \
   --policy.type=smolvla \
@@ -117,7 +126,7 @@ lerobot-train \
   --policy.load_vlm_weights=true \
   --policy.device=cuda \
   --policy.num_vlm_layers=16 \
-  --policy.n_obs_steps=10 \
+  --policy.n_obs_steps=1 \
   --policy.push_to_hub=false \
   --policy.lambda_labels_path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
   --dataset.repo_id=HuggingFaceVLA/libero \
