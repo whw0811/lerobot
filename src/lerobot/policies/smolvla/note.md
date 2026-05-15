@@ -105,18 +105,18 @@ python -m lerobot.policies.smolvla.lambda_labels \
   --output-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
   --lambda-error-q-low=0.05 \
   --lambda-error-q-high=0.95 \
-  --lambda-envelope-window=5 \
+  --lambda-envelope-window=10 \
   --lambda-smoothing-window=11 \
-  --lambda-smoothing-alpha=0.7 \
+  --lambda-smoothing-alpha=0.5 \
   --diagnostics-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_diagnostics.csv
 
 python -m lerobot.policies.smolvla.lambda_label_viewer \
   --repo-id=HuggingFaceVLA/libero \
   --root=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero \
   --labels-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
-  --episode=10 \
+  --episode=0 \
   --fps=10 \
-  --output-video=/root/autodl-tmp/lambda_episode10.mp4
+  --output-video=/root/autodl-tmp/lambda_episode0.mp4
 
 
   2.2 正式训练
@@ -140,21 +140,40 @@ lerobot-train \
   --eval_freq=0 \
   --dataset.use_image_cache=true \
   --dataset.image_cache_dir=/root/autodl-tmp/image_cache/libero \
-  --output_dir=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda
+  --output_dir=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda2
 
 2.3 测试
+export HF_HOME=/root/autodl-tmp/hf_cache/huggingface
+export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/huggingface/datasets
+export HF_HUB_CACHE=/root/autodl-tmp/hf_cache/huggingface/hub
+export TMPDIR=/root/autodl-tmp/tmp
+export HF_HUB_DISABLE_XET=1
+export MUJOCO_GL=egl
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate lerobot
 
 lerobot-eval \
-  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda/1to50_dynamic_freq/100000 \
+  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda2/without_dynamic_freq/100000 \
   --env.type=libero \
   --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
   --eval.batch_size=1 \
   --eval.n_episodes=10 \
-  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda/checkpoints/100000/pretrained_model \
+  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda2/checkpoints/100000/pretrained_model \
   --policy.n_action_steps=10 \
   --seed=42 \
-  --policy.dynamic_n_action_steps=true \
+  --policy.dynamic_n_action_steps=false \
   --policy.dynamic_n_action_steps_min=5 \
   --policy.dynamic_n_action_steps_max=10
+
+python -m lerobot.policies.smolvla.lambda_label_viewer \
+  --repo-id=HuggingFaceVLA/libero \
+  --root=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero \
+  --labels-path=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero/lambda_labels.pt \
+  --policy-path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda2/checkpoints/100000/pretrained_model \
+  --episode=3 \
+  --fps=10 \
+  --device=cuda \
+  --output-video=/root/autodl-tmp/lambda_lambda_hat_episode3.mp4

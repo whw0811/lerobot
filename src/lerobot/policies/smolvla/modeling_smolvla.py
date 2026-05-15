@@ -567,7 +567,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": ["lambda_head", "lambda_token_mlp"],
+            "modules_to_save": ["lambda_query", "lambda_expert_head"],
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -659,20 +659,13 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
-        self.lambda_head = nn.Sequential(
-            nn.Linear(
-                self.vlm_with_expert.config.text_config.hidden_size,
-                self.vlm_with_expert.config.text_config.hidden_size,
-            ),
-            nn.SiLU(),
-            nn.Linear(self.vlm_with_expert.config.text_config.hidden_size, 1),
-        )
-        self.lambda_token_mlp = nn.Sequential(
-            nn.Linear(1, self.vlm_with_expert.expert_hidden_size),
-            nn.SiLU(),
+        self.lambda_query = nn.Embedding(1, self.vlm_with_expert.expert_hidden_size)
+        nn.init.zeros_(self.lambda_query.weight)
+        self.lambda_expert_head = nn.Sequential(
             nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.vlm_with_expert.expert_hidden_size, 1),
         )
-        self.register_buffer("lambda_train_step", torch.zeros((), dtype=torch.long), persistent=True)
         self.last_lambda_hat: Tensor | None = None
 
         self.set_requires_grad()
@@ -716,40 +709,12 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def compute_lambda_alpha(self) -> float:
-        if self.config.lambda_alpha_warmup_steps == 0:
-            return float(self.config.lambda_alpha_end)
-        progress = min(
-            1.0,
-            float(self.lambda_train_step.item()) / float(self.config.lambda_alpha_warmup_steps),
-        )
-        return float(
-            self.config.lambda_alpha_start
-            + progress * (self.config.lambda_alpha_end - self.config.lambda_alpha_start)
-        )
+    def compute_lambda_hat_from_suffix(self, suffix_out: Tensor) -> Tensor:
+        lambda_out = suffix_out[:, 0].to(dtype=torch.float32)
+        return torch.sigmoid(self.lambda_expert_head(lambda_out)).squeeze(-1)
 
     def update_lambda_train_step(self) -> None:
-        self.lambda_train_step.add_(1)
-
-    def predict_lambda_from_prefix(self, prefix_out: Tensor, prefix_pad_masks: Tensor) -> Tensor:
-        mask = prefix_pad_masks.to(dtype=prefix_out.dtype).unsqueeze(-1)
-        pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return torch.sigmoid(self.lambda_head(pooled)).squeeze(-1)
-
-    def compute_lambda_condition(
-        self,
-        lambda_hat: Tensor,
-        lambda_t: Tensor | None,
-        lambda_is_valid: Tensor | None,
-        alpha: float,
-    ) -> Tensor:
-        pred = lambda_hat.detach()
-        if lambda_t is None or lambda_is_valid is None:
-            return pred
-        labels = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
-        valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
-        mixed = (1.0 - alpha) * labels + alpha * pred
-        return torch.where(valid, mixed, pred).detach()
+        pass
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -845,7 +810,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep, lambda_cond: Tensor | None = None):
+    def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -873,10 +838,10 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
-        if self.config.lambda_conditioning and lambda_cond is not None:
-            lambda_token = self.lambda_token_mlp(lambda_cond[:, None].to(device=device, dtype=dtype))[
-                :, None, :
-            ]
+        if self.config.predict_lambda_with_action_expert:
+            lambda_token = self.lambda_query.weight.to(device=device, dtype=dtype)[None, :, :].expand(
+                bsize, -1, -1
+            )
             embs.append(lambda_token)
             pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
             att_masks += [1]
@@ -923,37 +888,6 @@ class VLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state
         )
 
-        if self.config.lambda_conditioning:
-            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            prefix_outputs, past_key_values = self.vlm_with_expert.forward(
-                attention_mask=prefix_att_2d_masks,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
-                fill_kv_cache=True,
-            )
-            lambda_hat = self.predict_lambda_from_prefix(
-                prefix_outputs[0].to(dtype=torch.float32), prefix_pad_masks
-            )
-            lambda_cond = self.compute_lambda_condition(
-                lambda_hat=lambda_hat,
-                lambda_t=lambda_t,
-                lambda_is_valid=lambda_is_valid,
-                alpha=self.compute_lambda_alpha(),
-            )
-            v_t = self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=x_t,
-                timestep=time,
-                lambda_cond=lambda_cond,
-            )
-            losses = F.mse_loss(u_t, v_t, reduction="none")
-            self.last_lambda_hat = lambda_hat.detach()
-            return {"losses": losses, "lambda_hat": lambda_hat}
-
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -969,12 +903,17 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+        lambda_hat = None
+        if self.config.predict_lambda_with_action_expert:
+            lambda_hat = self.compute_lambda_hat_from_suffix(suffix_out)
+            self.last_lambda_hat = lambda_hat.detach()
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return {"losses": losses, "lambda_hat": None}
+        return {"losses": losses, "lambda_hat": lambda_hat}
 
     def sample_actions(
         self,
@@ -1000,7 +939,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
+        _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -1008,13 +947,6 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        lambda_cond = None
-        if self.config.lambda_conditioning:
-            lambda_hat = self.predict_lambda_from_prefix(
-                prefix_outputs[0].to(dtype=torch.float32), prefix_pad_masks
-            )
-            lambda_cond = lambda_hat.detach()
-            self.last_lambda_hat = lambda_cond
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
@@ -1030,7 +962,6 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
-                    lambda_cond=lambda_cond,
                 )
 
             if self._rtc_enabled():
@@ -1062,12 +993,9 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
-        lambda_cond: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, timestep, lambda_cond=lambda_cond
-        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1089,6 +1017,10 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1]
+        if self.config.predict_lambda_with_action_expert:
+            lambda_hat = self.compute_lambda_hat_from_suffix(suffix_out)
+            self.last_lambda_hat = lambda_hat.detach()
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)

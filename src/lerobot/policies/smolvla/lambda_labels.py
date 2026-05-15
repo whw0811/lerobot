@@ -16,11 +16,19 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.utils.constants import ACTION
 
 
+DEFAULT_LAMBDA_CHUNK_SIZE = 20
+DEFAULT_LAMBDA_ANCHOR_INDICES = (0, 5, 10, 15, 19)
+DEFAULT_LAMBDA_QUERY_INDICES = tuple(
+    idx for idx in range(DEFAULT_LAMBDA_CHUNK_SIZE) if idx not in DEFAULT_LAMBDA_ANCHOR_INDICES
+)
+
+
 @dataclass(frozen=True)
 class LambdaLabelConfig:
-    chunk_size: int = 10
-    anchor_indices: tuple[int, ...] = (0, 3, 6, 9)
-    query_indices: tuple[int, ...] = (1, 2, 4, 5, 7, 8)
+    chunk_size: int = DEFAULT_LAMBDA_CHUNK_SIZE
+    anchor_indices: tuple[int, ...] = DEFAULT_LAMBDA_ANCHOR_INDICES
+    query_indices: tuple[int, ...] = DEFAULT_LAMBDA_QUERY_INDICES
+    position_weights: tuple[float, ...] | None = None
     eps: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -38,6 +46,11 @@ class LambdaLabelConfig:
         expected = set(range(self.chunk_size))
         if all_indices != expected:
             raise ValueError("anchor_indices and query_indices must cover every chunk position")
+        if self.position_weights is not None:
+            if len(self.position_weights) != self.chunk_size:
+                raise ValueError("position_weights must have one value per chunk position")
+            if any(weight < 0 for weight in self.position_weights):
+                raise ValueError("position_weights must be non-negative")
 
 
 class LambdaMetrics(NamedTuple):
@@ -60,6 +73,12 @@ class PreloadedActionColumns(NamedTuple):
     episode_indices: Tensor
     actions: Tensor
     row_by_index: dict[int, int]
+
+
+class FramewisePchipErrors(NamedTuple):
+    indices: Tensor
+    episode_indices: Tensor
+    pchip_error: Tensor
 
 
 def compute_pchip_trend(action_chunks: Tensor, cfg: LambdaLabelConfig) -> Tensor:
@@ -109,6 +128,67 @@ def _normalize_by_quantiles(values: Tensor, q_low: float, q_high: float, eps: fl
     return normalized.to(dtype=values.dtype), q_low_value, q_high_value
 
 
+def _position_weights_tensor(cfg: LambdaLabelConfig, device: torch.device, dtype: torch.dtype) -> Tensor:
+    if cfg.position_weights is None:
+        return torch.ones(cfg.chunk_size, dtype=dtype, device=device)
+    return torch.tensor(cfg.position_weights, dtype=dtype, device=device)
+
+
+def compute_framewise_pchip_errors(
+    chunks: Tensor,
+    indices: Tensor,
+    episode_indices: Tensor,
+    cfg: LambdaLabelConfig,
+) -> FramewisePchipErrors:
+    if chunks.ndim != 3 or chunks.shape[1] != cfg.chunk_size:
+        raise ValueError(f"Expected chunks shaped [N, {cfg.chunk_size}, D]")
+
+    indices = torch.as_tensor(indices, dtype=torch.long, device=chunks.device).view(-1)
+    episode_indices = torch.as_tensor(episode_indices, dtype=torch.long, device=chunks.device).view(-1)
+    if chunks.shape[0] != indices.numel() or chunks.shape[0] != episode_indices.numel():
+        raise ValueError("chunks, indices, and episode_indices must have matching first dimensions")
+
+    trend = compute_pchip_trend(chunks, cfg)
+    query_positions = torch.tensor(cfg.query_indices, dtype=torch.long, device=chunks.device)
+    position_weights = _position_weights_tensor(cfg, chunks.device, chunks.dtype)
+    query_weights = position_weights[query_positions]
+    keep_positions = query_weights > 0
+    if not torch.any(keep_positions):
+        raise ValueError("At least one non-anchor position must have a positive aggregation weight")
+
+    query_positions = query_positions[keep_positions]
+    query_weights = query_weights[keep_positions]
+    position_errors = (chunks - trend).pow(2).mean(dim=2)
+
+    contribution_indices = indices[:, None] + query_positions[None, :]
+    contribution_episodes = episode_indices[:, None].expand_as(contribution_indices)
+    contribution_errors = position_errors[:, query_positions] * query_weights[None, :]
+    contribution_weights = query_weights[None, :].expand_as(contribution_errors)
+
+    flat_indices = contribution_indices.reshape(-1)
+    flat_episodes = contribution_episodes.reshape(-1)
+    flat_errors = contribution_errors.reshape(-1)
+    flat_weights = contribution_weights.reshape(-1)
+
+    valid_indices, inverse = torch.unique(flat_indices, sorted=True, return_inverse=True)
+    weighted_error_sum = torch.zeros(valid_indices.numel(), dtype=chunks.dtype, device=chunks.device)
+    weight_sum = torch.zeros_like(weighted_error_sum)
+    weighted_error_sum.scatter_add_(0, inverse, flat_errors)
+    weight_sum.scatter_add_(0, inverse, flat_weights)
+    pchip_error = weighted_error_sum / torch.clamp(weight_sum, min=cfg.eps)
+
+    first_rows = torch.full((valid_indices.numel(),), flat_indices.numel(), dtype=torch.long, device=chunks.device)
+    source_rows = torch.arange(flat_indices.numel(), dtype=torch.long, device=chunks.device)
+    first_rows.scatter_reduce_(0, inverse, source_rows, reduce="amin", include_self=True)
+    valid_episode_indices = flat_episodes[first_rows]
+
+    return FramewisePchipErrors(
+        indices=valid_indices,
+        episode_indices=valid_episode_indices,
+        pchip_error=pchip_error,
+    )
+
+
 def _smooth_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) -> Tensor:
     if values.ndim != 1 or episode_indices.ndim != 1:
         raise ValueError("values and episode_indices must be 1D tensors")
@@ -133,6 +213,7 @@ def _smooth_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) 
 
 
 def _max_envelope_1d_by_episode(values: Tensor, episode_indices: Tensor, window: int) -> Tensor:
+    """Compute a forward-looking max envelope within each episode."""
     if values.ndim != 1 or episode_indices.ndim != 1:
         raise ValueError("values and episode_indices must be 1D tensors")
     if values.numel() != episode_indices.numel():
@@ -143,15 +224,12 @@ def _max_envelope_1d_by_episode(values: Tensor, episode_indices: Tensor, window:
         return values.clone()
 
     envelope = torch.empty_like(values)
-    left = (window - 1) // 2
-    right = window // 2
     for episode_index in torch.unique(episode_indices, sorted=True):
         positions = torch.nonzero(episode_indices == episode_index, as_tuple=False).flatten()
         episode_values = values[positions]
         for row in range(episode_values.numel()):
-            start = max(0, row - left)
-            end = min(episode_values.numel(), row + right + 1)
-            envelope[positions[row]] = episode_values[start:end].max()
+            end = min(episode_values.numel(), row + window)
+            envelope[positions[row]] = episode_values[row:end].max()
     return envelope
 
 
@@ -416,6 +494,7 @@ def generate_lambda_labels_from_chunks(
     )
     return {
         "valid_indices": indices.detach().cpu(),
+        "episode_indices": episode_indices.detach().cpu(),
         "lambda_t": metrics.lambda_t.detach().cpu().to(dtype=torch.float32),
         "metrics": _summarize_lambda_metrics(metrics),
         "pchip_error": metrics.pchip_error.detach().cpu().to(dtype=torch.float32),
@@ -426,6 +505,15 @@ def generate_lambda_labels_from_chunks(
 
 def _format_csv_float(value: Tensor | float) -> str:
     return str(round(float(value), 6))
+
+
+def _parse_position_weights(value: str | None) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    weights = tuple(float(part.strip()) for part in value.split(",") if part.strip())
+    if not weights:
+        raise ValueError("lambda-position-weights must contain at least one numeric value")
+    return weights
 
 
 def save_lambda_diagnostics_csv(
@@ -476,6 +564,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-envelope-window", type=int, default=5)
     parser.add_argument("--lambda-smoothing-window", type=int, default=11)
     parser.add_argument("--lambda-smoothing-alpha", type=float, default=0.7)
+    parser.add_argument(
+        "--lambda-position-weights",
+        default=None,
+        help="Comma-separated per-position aggregation weights. Defaults to 1 for every chunk position.",
+    )
     parser.add_argument("--diagnostics-path", default=None)
     return parser
 
@@ -484,7 +577,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
     from lerobot.datasets import LeRobotDataset
 
     dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root, revision=args.revision)
-    cfg = LambdaLabelConfig()
+    cfg = LambdaLabelConfig(position_weights=_parse_position_weights(args.lambda_position_weights))
     chunk_batch = extract_action_chunks_from_dataset(dataset, cfg)
     action_norm_mode = NormalizationMode(args.normalization_mode)
     normalized_chunks = normalize_action_chunks(
@@ -510,6 +603,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         "chunk_size": cfg.chunk_size,
         "anchor_indices": list(cfg.anchor_indices),
         "query_indices": list(cfg.query_indices),
+        "position_weights": list(_position_weights_tensor(cfg, torch.device("cpu"), torch.float32).tolist()),
         "normalization_mode": action_norm_mode.value,
         "lambda_error_q_low": args.lambda_error_q_low,
         "lambda_error_q_high": args.lambda_error_q_high,
@@ -528,7 +622,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         save_lambda_diagnostics_csv(
             path=args.diagnostics_path,
             indices=labels["valid_indices"],
-            episode_indices=chunk_batch.episode_indices,
+            episode_indices=labels["episode_indices"],
             pchip_error=labels["pchip_error"],
             lambda_raw=labels["lambda_raw"],
             lambda_t=labels["lambda_t"],
