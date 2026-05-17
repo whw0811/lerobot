@@ -53,12 +53,14 @@ class SmolVLALambdaLabelProcessorStep(ComplementaryDataProcessorStep):
     def complementary_data(self, complementary_data: dict[str, Any]) -> dict[str, Any]:
         if "index" not in complementary_data:
             complementary_data["lambda_t"] = torch.tensor(self.default_value, dtype=torch.float32)
+            complementary_data["lambda_confidence"] = torch.tensor(0.0, dtype=torch.float32)
             complementary_data["lambda_is_valid"] = torch.tensor(False, dtype=torch.bool)
             return complementary_data
 
         index = torch.as_tensor(complementary_data["index"], dtype=torch.long)
-        lambda_t, lambda_is_valid = self._lookup.lookup(index)
+        lambda_t, lambda_confidence, lambda_is_valid = self._lookup.lookup_with_confidence(index)
         complementary_data["lambda_t"] = lambda_t
+        complementary_data["lambda_confidence"] = lambda_confidence
         complementary_data["lambda_is_valid"] = lambda_is_valid
         return complementary_data
 

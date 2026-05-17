@@ -15,9 +15,8 @@ from torch import Tensor
 from lerobot.configs.types import NormalizationMode
 from lerobot.utils.constants import ACTION
 
-
-DEFAULT_LAMBDA_CHUNK_SIZE = 20
-DEFAULT_LAMBDA_ANCHOR_INDICES = (0, 5, 10, 15, 19)
+DEFAULT_LAMBDA_CHUNK_SIZE = 10
+DEFAULT_LAMBDA_ANCHOR_INDICES = (0, 3, 6, 9)
 DEFAULT_LAMBDA_QUERY_INDICES = tuple(
     idx for idx in range(DEFAULT_LAMBDA_CHUNK_SIZE) if idx not in DEFAULT_LAMBDA_ANCHOR_INDICES
 )
@@ -126,6 +125,51 @@ def _normalize_by_quantiles(values: Tensor, q_low: float, q_high: float, eps: fl
     denom = torch.clamp(q_high_value - q_low_value, min=eps)
     normalized = torch.clamp((values_f32 - q_low_value) / denom, min=0.0, max=1.0)
     return normalized.to(dtype=values.dtype), q_low_value, q_high_value
+
+
+def compute_dct_high_frequency_ratio(
+    action_chunks: Tensor,
+    high_freq_start: int | None = None,
+    eps: float = 1e-6,
+) -> Tensor:
+    if action_chunks.ndim != 3:
+        raise ValueError("Expected action_chunks shaped [N, T, D]")
+    chunk_size = action_chunks.shape[1]
+    if chunk_size < 2:
+        raise ValueError("DCT high-frequency ratio requires chunk_size >= 2")
+    if high_freq_start is None:
+        high_freq_start = max(1, chunk_size // 2)
+    if not 1 <= high_freq_start < chunk_size:
+        raise ValueError("high_freq_start must be in [1, chunk_size)")
+
+    chunks = action_chunks.float()
+    centered = chunks - chunks.mean(dim=1, keepdim=True)
+    n = torch.arange(chunk_size, dtype=chunks.dtype, device=chunks.device)
+    k = torch.arange(chunk_size, dtype=chunks.dtype, device=chunks.device)
+    basis = torch.cos(torch.pi / chunk_size * (n[None, :] + 0.5) * k[:, None])
+    coeffs = torch.einsum("kt,btd->bkd", basis, centered)
+
+    total_energy = coeffs[:, 1:, :].pow(2).sum(dim=(1, 2))
+    high_energy = coeffs[:, high_freq_start:, :].pow(2).sum(dim=(1, 2))
+    ratio = high_energy / torch.clamp(total_energy, min=eps)
+    return torch.where(total_energy > eps, ratio, torch.zeros_like(ratio)).to(dtype=action_chunks.dtype)
+
+
+def compute_lambda_confidence(
+    lambda_pchip: Tensor,
+    lambda_dct: Tensor,
+    alpha_conf_min: float = 0.15,
+    alpha_conf_max: float = 1.0,
+) -> Tensor:
+    if not 0.0 <= alpha_conf_min <= alpha_conf_max <= 1.0:
+        raise ValueError("alpha_conf_min and alpha_conf_max must satisfy 0 <= min <= max <= 1")
+    lambda_pchip = torch.as_tensor(lambda_pchip, dtype=lambda_dct.dtype, device=lambda_dct.device)
+    consistency = 1.0 - torch.clamp((lambda_pchip - lambda_dct).abs(), min=0.0, max=1.0)
+    return torch.clamp(
+        alpha_conf_min + (alpha_conf_max - alpha_conf_min) * consistency,
+        min=alpha_conf_min,
+        max=alpha_conf_max,
+    )
 
 
 def _position_weights_tensor(cfg: LambdaLabelConfig, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -288,6 +332,25 @@ def _summarize_lambda_metrics(metrics: LambdaMetrics) -> dict[str, Tensor]:
     }
 
 
+def _summarize_dct_metrics(
+    dct_high_freq_ratio: Tensor,
+    lambda_dct: Tensor,
+    alpha_conf: Tensor,
+    dct_q_low_value: Tensor,
+    dct_q_high_value: Tensor,
+) -> dict[str, Tensor]:
+    return {
+        "dct_high_freq_ratio_mean": dct_high_freq_ratio.mean().detach(),
+        "dct_high_freq_ratio_std": dct_high_freq_ratio.std(unbiased=False).detach(),
+        "lambda_dct_mean": lambda_dct.mean().detach(),
+        "lambda_dct_std": lambda_dct.std(unbiased=False).detach(),
+        "alpha_conf_mean": alpha_conf.mean().detach(),
+        "alpha_conf_std": alpha_conf.std(unbiased=False).detach(),
+        "dct_q_low_value": dct_q_low_value.detach(),
+        "dct_q_high_value": dct_q_high_value.detach(),
+    }
+
+
 def normalize_action_chunks(
     action_chunks: Tensor,
     action_stats: dict[str, Any],
@@ -329,25 +392,52 @@ def normalize_action_chunks(
 def save_lambda_sidecar(
     path: str | Path,
     valid_indices: Tensor,
-    lambda_t: Tensor,
-    metrics: dict[str, Tensor],
-    metadata: dict[str, Any],
+    lambda_t: Tensor | None = None,
+    metrics: dict[str, Tensor] | None = None,
+    metadata: dict[str, Any] | None = None,
+    *,
+    lambda_pchip: Tensor | None = None,
+    alpha_conf: Tensor | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if lambda_pchip is None:
+        if lambda_t is None:
+            raise ValueError("save_lambda_sidecar requires lambda_pchip or lambda_t")
+        lambda_pchip = lambda_t
+    if lambda_t is None:
+        lambda_t = lambda_pchip
+
+    lambda_pchip = torch.as_tensor(lambda_pchip, dtype=torch.float32).view(-1)
+    lambda_t = torch.as_tensor(lambda_t, dtype=torch.float32).view(-1)
+    if alpha_conf is None:
+        alpha_conf = torch.ones_like(lambda_pchip)
+    alpha_conf = torch.as_tensor(alpha_conf, dtype=torch.float32).view(-1)
+    valid_indices = torch.as_tensor(valid_indices, dtype=torch.long).view(-1)
+    if not (valid_indices.numel() == lambda_pchip.numel() == lambda_t.numel() == alpha_conf.numel()):
+        raise ValueError("valid_indices, lambda_pchip, lambda_t, and alpha_conf must have matching lengths")
+
     payload: dict[str, Any] = {
-        "valid_indices": valid_indices.detach().cpu().to(dtype=torch.long),
+        "valid_indices": valid_indices.detach().cpu(),
+        "lambda_pchip": lambda_pchip.detach().cpu(),
         "lambda_t": lambda_t.detach().cpu().to(dtype=torch.float32),
-        "metrics": {key: torch.as_tensor(value).detach().cpu() for key, value in metrics.items()},
-        "metadata": metadata,
+        "alpha_conf": alpha_conf.detach().cpu(),
+        "metrics": {
+            key: torch.as_tensor(value).detach().cpu() for key, value in (metrics or {}).items()
+        },
+        "metadata": metadata or {},
     }
     torch.save(payload, path)
 
 
 def load_lambda_sidecar(path: str | Path) -> dict[str, Any]:
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-    if "valid_indices" not in payload or "lambda_t" not in payload:
-        raise ValueError("Lambda sidecar must contain valid_indices and lambda_t")
+    if "valid_indices" not in payload or ("lambda_pchip" not in payload and "lambda_t" not in payload):
+        raise ValueError("Lambda sidecar must contain valid_indices and lambda_pchip or lambda_t")
+    if "lambda_pchip" not in payload:
+        payload["lambda_pchip"] = payload["lambda_t"]
+    if "lambda_t" not in payload:
+        payload["lambda_t"] = payload["lambda_pchip"]
     payload.pop("lambda_by_index", None)
     payload.pop("diagnostics", None)
     return payload
@@ -357,32 +447,51 @@ class LambdaLabelLookup:
     def __init__(self, payload: dict[str, Any], default_value: float = 0.0):
         self.default_value = float(default_value)
         indices = torch.as_tensor(payload["valid_indices"], dtype=torch.long)
-        values = torch.as_tensor(payload["lambda_t"], dtype=torch.float32)
-        if indices.ndim != 1 or values.ndim != 1:
-            raise ValueError("Lambda sidecar valid_indices and lambda_t must be 1D tensors")
-        if indices.numel() != values.numel():
-            raise ValueError("Lambda sidecar valid_indices and lambda_t must have the same length")
+        values = torch.as_tensor(payload.get("lambda_pchip", payload["lambda_t"]), dtype=torch.float32)
+        confidence = torch.as_tensor(
+            payload.get("alpha_conf", torch.ones_like(values, dtype=torch.float32)),
+            dtype=torch.float32,
+        )
+        if indices.ndim != 1 or values.ndim != 1 or confidence.ndim != 1:
+            raise ValueError("Lambda sidecar valid_indices, lambda_pchip, and alpha_conf must be 1D tensors")
+        if not (indices.numel() == values.numel() == confidence.numel()):
+            raise ValueError("Lambda sidecar valid_indices, lambda_pchip, and alpha_conf must match length")
 
         order = torch.argsort(indices)
         self._indices = indices[order].cpu()
         self._values = values[order].cpu()
+        self._confidence = confidence[order].cpu()
         if self._indices.numel() > 1 and torch.any(self._indices[1:] == self._indices[:-1]):
             raise ValueError("Lambda sidecar valid_indices must be unique")
 
     def lookup(self, indices: Tensor) -> tuple[Tensor, Tensor]:
+        values, _confidence, valid = self.lookup_with_confidence(indices)
+        return values, valid
+
+    def lookup_with_confidence(self, indices: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         indices_tensor = torch.as_tensor(indices, dtype=torch.long)
         flat_indices = indices_tensor.view(-1).cpu()
         values = torch.full((flat_indices.numel(),), self.default_value, dtype=torch.float32)
+        confidence = torch.zeros((flat_indices.numel(),), dtype=torch.float32)
         valid = torch.zeros((flat_indices.numel(),), dtype=torch.bool)
         if self._indices.numel() == 0:
-            return values.view(indices_tensor.shape), valid.view(indices_tensor.shape)
+            return (
+                values.view(indices_tensor.shape),
+                confidence.view(indices_tensor.shape),
+                valid.view(indices_tensor.shape),
+            )
 
         positions = torch.searchsorted(self._indices, flat_indices)
         in_bounds = positions < self._indices.numel()
         safe_positions = positions.clamp(max=self._indices.numel() - 1)
         valid = in_bounds & (self._indices[safe_positions] == flat_indices)
         values[valid] = self._values[safe_positions[valid]]
-        return values.view(indices_tensor.shape), valid.view(indices_tensor.shape)
+        confidence[valid] = self._confidence[safe_positions[valid]]
+        return (
+            values.view(indices_tensor.shape),
+            confidence.view(indices_tensor.shape),
+            valid.view(indices_tensor.shape),
+        )
 
 
 def _episode_value(episode: dict[str, Any], key: str) -> int:
@@ -473,6 +582,11 @@ def generate_lambda_labels_from_chunks(
     cfg: LambdaLabelConfig,
     q_low: float = 0.05,
     q_high: float = 0.95,
+    dct_q_low: float | None = None,
+    dct_q_high: float | None = None,
+    dct_high_freq_start: int | None = None,
+    alpha_conf_min: float = 0.15,
+    alpha_conf_max: float = 1.0,
     envelope_window: int = 5,
     smoothing_window: int = 11,
     smoothing_alpha: float = 0.7,
@@ -492,14 +606,46 @@ def generate_lambda_labels_from_chunks(
         smoothing_window=smoothing_window,
         smoothing_alpha=smoothing_alpha,
     )
+    dct_high_freq_ratio = compute_dct_high_frequency_ratio(
+        chunks,
+        high_freq_start=dct_high_freq_start,
+        eps=cfg.eps,
+    )
+    lambda_dct_raw, dct_q_low_value, dct_q_high_value = _normalize_by_quantiles(
+        dct_high_freq_ratio,
+        q_low=q_low if dct_q_low is None else dct_q_low,
+        q_high=q_high if dct_q_high is None else dct_q_high,
+        eps=cfg.eps,
+    )
+    lambda_dct = _max_envelope_1d_by_episode(lambda_dct_raw, episode_indices, envelope_window)
+    alpha_conf = compute_lambda_confidence(
+        lambda_pchip=metrics.lambda_t,
+        lambda_dct=lambda_dct,
+        alpha_conf_min=alpha_conf_min,
+        alpha_conf_max=alpha_conf_max,
+    )
+    metric_summary = _summarize_lambda_metrics(metrics)
+    metric_summary.update(
+        _summarize_dct_metrics(
+            dct_high_freq_ratio=dct_high_freq_ratio,
+            lambda_dct=lambda_dct,
+            alpha_conf=alpha_conf,
+            dct_q_low_value=dct_q_low_value,
+            dct_q_high_value=dct_q_high_value,
+        )
+    )
     return {
         "valid_indices": indices.detach().cpu(),
         "episode_indices": episode_indices.detach().cpu(),
+        "lambda_pchip": metrics.lambda_t.detach().cpu().to(dtype=torch.float32),
         "lambda_t": metrics.lambda_t.detach().cpu().to(dtype=torch.float32),
-        "metrics": _summarize_lambda_metrics(metrics),
+        "alpha_conf": alpha_conf.detach().cpu().to(dtype=torch.float32),
+        "metrics": metric_summary,
         "pchip_error": metrics.pchip_error.detach().cpu().to(dtype=torch.float32),
         "lambda_raw": metrics.lambda_raw.detach().cpu().to(dtype=torch.float32),
         "lambda_envelope": metrics.lambda_envelope.detach().cpu().to(dtype=torch.float32),
+        "dct_high_freq_ratio": dct_high_freq_ratio.detach().cpu().to(dtype=torch.float32),
+        "lambda_dct": lambda_dct.detach().cpu().to(dtype=torch.float32),
     }
 
 
@@ -522,7 +668,10 @@ def save_lambda_diagnostics_csv(
     episode_indices: Tensor,
     pchip_error: Tensor,
     lambda_raw: Tensor,
-    lambda_t: Tensor,
+    lambda_pchip: Tensor,
+    dct_high_freq_ratio: Tensor,
+    lambda_dct: Tensor,
+    alpha_conf: Tensor,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,29 +680,44 @@ def save_lambda_diagnostics_csv(
         torch.as_tensor(episode_indices, dtype=torch.long).view(-1).tolist(),
         torch.as_tensor(pchip_error, dtype=torch.float32).view(-1),
         torch.as_tensor(lambda_raw, dtype=torch.float32).view(-1),
-        torch.as_tensor(lambda_t, dtype=torch.float32).view(-1),
+        torch.as_tensor(lambda_pchip, dtype=torch.float32).view(-1),
+        torch.as_tensor(dct_high_freq_ratio, dtype=torch.float32).view(-1),
+        torch.as_tensor(lambda_dct, dtype=torch.float32).view(-1),
+        torch.as_tensor(alpha_conf, dtype=torch.float32).view(-1),
         strict=True,
     )
     with path.open("w", newline="") as csv_file:
         writer = csv.DictWriter(
             csv_file,
-            fieldnames=["index", "episode_index", "pchip_error", "lambda_raw", "lambda_t"],
+            fieldnames=[
+                "index",
+                "episode_index",
+                "pchip_error",
+                "lambda_raw",
+                "lambda_pchip",
+                "dct_high_freq_ratio",
+                "lambda_dct",
+                "alpha_conf",
+            ],
         )
         writer.writeheader()
-        for index, episode_index, error, raw_value, value in rows:
+        for index, episode_index, error, raw_value, value, dct_ratio, dct_value, confidence in rows:
             writer.writerow(
                 {
                     "index": int(index),
                     "episode_index": int(episode_index),
                     "pchip_error": _format_csv_float(error),
                     "lambda_raw": _format_csv_float(raw_value),
-                    "lambda_t": _format_csv_float(value),
+                    "lambda_pchip": _format_csv_float(value),
+                    "dct_high_freq_ratio": _format_csv_float(dct_ratio),
+                    "lambda_dct": _format_csv_float(dct_value),
+                    "alpha_conf": _format_csv_float(confidence),
                 }
             )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate SmolVLA PCHIP error lambda labels.")
+    parser = argparse.ArgumentParser(description="Generate SmolVLA PCHIP lambda labels with DCT confidence.")
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--root", default=None)
     parser.add_argument("--revision", default=None)
@@ -561,6 +725,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalization-mode", default=NormalizationMode.MEAN_STD.value)
     parser.add_argument("--lambda-error-q-low", type=float, default=0.05)
     parser.add_argument("--lambda-error-q-high", type=float, default=0.95)
+    parser.add_argument("--lambda-dct-q-low", type=float, default=None)
+    parser.add_argument("--lambda-dct-q-high", type=float, default=None)
+    parser.add_argument("--lambda-dct-high-freq-start", type=int, default=None)
+    parser.add_argument("--lambda-alpha-conf-min", type=float, default=0.15)
+    parser.add_argument("--lambda-alpha-conf-max", type=float, default=1.0)
     parser.add_argument("--lambda-envelope-window", type=int, default=5)
     parser.add_argument("--lambda-smoothing-window", type=int, default=11)
     parser.add_argument("--lambda-smoothing-alpha", type=float, default=0.7)
@@ -590,6 +759,11 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         cfg=cfg,
         q_low=args.lambda_error_q_low,
         q_high=args.lambda_error_q_high,
+        dct_q_low=args.lambda_dct_q_low,
+        dct_q_high=args.lambda_dct_q_high,
+        dct_high_freq_start=args.lambda_dct_high_freq_start,
+        alpha_conf_min=args.lambda_alpha_conf_min,
+        alpha_conf_max=args.lambda_alpha_conf_max,
         envelope_window=args.lambda_envelope_window,
         smoothing_window=args.lambda_smoothing_window,
         smoothing_alpha=args.lambda_smoothing_alpha,
@@ -599,7 +773,7 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         "root": args.root,
         "revision": args.revision,
         "created_at": datetime.now(UTC).isoformat(),
-        "method": "pchip_error",
+        "method": "pchip_dct_consistency",
         "chunk_size": cfg.chunk_size,
         "anchor_indices": list(cfg.anchor_indices),
         "query_indices": list(cfg.query_indices),
@@ -607,6 +781,11 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
         "normalization_mode": action_norm_mode.value,
         "lambda_error_q_low": args.lambda_error_q_low,
         "lambda_error_q_high": args.lambda_error_q_high,
+        "lambda_dct_q_low": args.lambda_dct_q_low,
+        "lambda_dct_q_high": args.lambda_dct_q_high,
+        "lambda_dct_high_freq_start": args.lambda_dct_high_freq_start,
+        "lambda_alpha_conf_min": args.lambda_alpha_conf_min,
+        "lambda_alpha_conf_max": args.lambda_alpha_conf_max,
         "lambda_envelope_window": args.lambda_envelope_window,
         "lambda_smoothing_window": args.lambda_smoothing_window,
         "lambda_smoothing_alpha": args.lambda_smoothing_alpha,
@@ -614,7 +793,9 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
     save_lambda_sidecar(
         path=args.output_path,
         valid_indices=labels["valid_indices"],
+        lambda_pchip=labels["lambda_pchip"],
         lambda_t=labels["lambda_t"],
+        alpha_conf=labels["alpha_conf"],
         metrics=labels["metrics"],
         metadata=metadata,
     )
@@ -625,7 +806,10 @@ def run_offline_lambda_label_generation(args: argparse.Namespace) -> None:
             episode_indices=labels["episode_indices"],
             pchip_error=labels["pchip_error"],
             lambda_raw=labels["lambda_raw"],
-            lambda_t=labels["lambda_t"],
+            lambda_pchip=labels["lambda_pchip"],
+            dct_high_freq_ratio=labels["dct_high_freq_ratio"],
+            lambda_dct=labels["lambda_dct"],
+            alpha_conf=labels["alpha_conf"],
         )
 
 

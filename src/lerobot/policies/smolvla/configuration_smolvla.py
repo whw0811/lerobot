@@ -112,7 +112,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Dynamic closed-loop execution from predicted lambda
     dynamic_n_action_steps: bool = False
-    dynamic_n_action_steps_min: int = 3
+    dynamic_n_action_steps_min: int = 2
     dynamic_n_action_steps_max: int = 10
     lambda_ema_beta: float = 0.8
 

@@ -84,6 +84,63 @@ def compute_dynamic_n_action_steps(lambda_value: float, n_min: int, n_max: int) 
     return max(n_min, min(n_max, round(n_max - lambda_value * (n_max - n_min))))
 
 
+def compute_dynamic_n_action_steps_with_hysteresis(
+    lambda_value: float,
+    current_n: int | None,
+    n_min: int,
+    n_max: int,
+) -> int:
+    lambda_value = max(0.0, min(1.0, float(lambda_value)))
+    n_mid = max(n_min, min(n_max, round((n_min + n_max) / 2)))
+    n_current = n_max if current_n is None else int(current_n)
+
+    if n_current >= n_max:
+        return n_mid if lambda_value > 0.45 else n_max
+    if n_current <= n_min:
+        return n_mid if lambda_value < 0.55 else n_min
+    if lambda_value > 0.70:
+        return n_min
+    if lambda_value < 0.30:
+        return n_max
+    return n_mid
+
+
+def compute_lambda_supervision_loss(
+    lambda_hat: Tensor,
+    lambda_t: Tensor,
+    lambda_is_valid: Tensor,
+    lambda_confidence: Tensor | None = None,
+    loss_type: str = "smooth_l1",
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    lambda_t = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
+    lambda_is_valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
+    if lambda_confidence is None:
+        confidence = torch.ones_like(lambda_hat)
+    else:
+        confidence = lambda_confidence.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
+        confidence = confidence.clamp(0.0, 1.0)
+
+    if loss_type == "smooth_l1":
+        raw_lambda_loss = F.smooth_l1_loss(lambda_hat, lambda_t, reduction="none")
+    elif loss_type == "mse":
+        raw_lambda_loss = F.mse_loss(lambda_hat, lambda_t, reduction="none")
+    else:
+        raise ValueError("loss_type must be 'smooth_l1' or 'mse'")
+
+    zero = torch.zeros_like(raw_lambda_loss)
+    unweighted_per_sample = torch.where(lambda_is_valid, raw_lambda_loss, zero)
+    weighted_per_sample = torch.where(lambda_is_valid, raw_lambda_loss * confidence, zero)
+    valid_count = lambda_is_valid.sum().clamp_min(1)
+    loss = weighted_per_sample.sum() / valid_count
+    unweighted_loss = unweighted_per_sample.sum() / valid_count
+    confidence_mean = torch.where(lambda_is_valid, confidence, torch.zeros_like(confidence)).sum() / valid_count
+    stats = {
+        "lambda_loss_unweighted": unweighted_loss.detach().item(),
+        "lambda_confidence_mean": confidence_mean.detach().item(),
+    }
+    return loss, weighted_per_sample, stats
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -259,6 +316,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
         self._lambda_smooth = None
+        self._dynamic_n_action_steps = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -369,11 +427,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         else:
             beta = self.config.lambda_ema_beta
             self._lambda_smooth = beta * self._lambda_smooth + (1.0 - beta) * lambda_now
-        return compute_dynamic_n_action_steps(
-            self._lambda_smooth,
+        n_exec = compute_dynamic_n_action_steps_with_hysteresis(
+            lambda_value=self._lambda_smooth,
+            current_n=self._dynamic_n_action_steps,
             n_min=self.config.dynamic_n_action_steps_min,
             n_max=min(self.config.dynamic_n_action_steps_max, self.config.chunk_size),
         )
+        self._dynamic_n_action_steps = n_exec
+        return n_exec
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -437,23 +498,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lambda_loss_per_sample = None
         lambda_t = batch.get("lambda_t")
         lambda_is_valid = batch.get("lambda_is_valid")
+        lambda_confidence = batch.get("lambda_confidence")
         if lambda_hat is not None and lambda_t is not None and lambda_is_valid is not None:
-            lambda_t = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
-            lambda_is_valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(
-                lambda_hat
+            lambda_loss, lambda_loss_per_sample, lambda_stats = compute_lambda_supervision_loss(
+                lambda_hat=lambda_hat,
+                lambda_t=lambda_t,
+                lambda_is_valid=lambda_is_valid,
+                lambda_confidence=lambda_confidence,
+                loss_type=self.config.lambda_loss_type,
             )
-            if self.config.lambda_loss_type == "smooth_l1":
-                raw_lambda_loss = F.smooth_l1_loss(lambda_hat, lambda_t, reduction="none")
-            else:
-                raw_lambda_loss = F.mse_loss(lambda_hat, lambda_t, reduction="none")
-            lambda_loss_per_sample = torch.where(
-                lambda_is_valid, raw_lambda_loss, torch.zeros_like(raw_lambda_loss)
-            )
-            valid_count = lambda_is_valid.sum().clamp_min(1)
-            lambda_loss = lambda_loss_per_sample.sum() / valid_count
             loss_dict["lambda_loss"] = lambda_loss.item()
+            loss_dict["lambda_loss_weighted"] = (self.config.lambda_loss_weight * lambda_loss).item()
+            loss_dict.update(lambda_stats)
             loss_dict["lambda_hat_mean"] = lambda_hat.detach().mean().item()
-            loss_dict["lambda_valid_frac"] = lambda_is_valid.float().mean().item()
+            lambda_is_valid_for_stats = lambda_is_valid.to(
+                device=lambda_hat.device, dtype=torch.bool
+            ).view_as(lambda_hat)
+            loss_dict["lambda_valid_frac"] = lambda_is_valid_for_stats.float().mean().item()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over valid (time, action) entries
@@ -462,6 +523,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            loss_dict["action_loss"] = per_sample_loss.mean().item()
             if lambda_loss_per_sample is not None:
                 per_sample_loss = per_sample_loss + self.config.lambda_loss_weight * lambda_loss_per_sample
             loss_dict["loss"] = per_sample_loss.mean().item()
@@ -473,6 +535,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
+            loss_dict["action_loss"] = loss.item()
             if lambda_loss is not None:
                 loss = loss + self.config.lambda_loss_weight * lambda_loss
             loss_dict["loss"] = loss.item()
