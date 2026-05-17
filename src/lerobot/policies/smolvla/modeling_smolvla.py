@@ -79,32 +79,6 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
-def compute_dynamic_n_action_steps(lambda_value: float, n_min: int, n_max: int) -> int:
-    lambda_value = max(0.0, min(1.0, float(lambda_value)))
-    return max(n_min, min(n_max, round(n_max - lambda_value * (n_max - n_min))))
-
-
-def compute_dynamic_n_action_steps_with_hysteresis(
-    lambda_value: float,
-    current_n: int | None,
-    n_min: int,
-    n_max: int,
-) -> int:
-    lambda_value = max(0.0, min(1.0, float(lambda_value)))
-    n_mid = max(n_min, min(n_max, round((n_min + n_max) / 2)))
-    n_current = n_max if current_n is None else int(current_n)
-
-    if n_current >= n_max:
-        return n_mid if lambda_value > 0.45 else n_max
-    if n_current <= n_min:
-        return n_mid if lambda_value < 0.55 else n_min
-    if lambda_value > 0.70:
-        return n_min
-    if lambda_value < 0.30:
-        return n_max
-    return n_mid
-
-
 def compute_lambda_supervision_loss(
     lambda_hat: Tensor,
     lambda_t: Tensor,
@@ -315,8 +289,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        self._lambda_smooth = None
-        self._dynamic_n_action_steps = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -409,32 +381,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            n_exec = self._update_dynamic_n_action_steps(getattr(self.model, "last_lambda_hat", None))
-            self._queues[ACTION].extend(actions.transpose(0, 1)[:n_exec])
+            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
 
         return self._queues[ACTION].popleft()
 
     def _check_get_actions_condition(self) -> bool:
         return len(self._queues[ACTION]) == 0
-
-    def _update_dynamic_n_action_steps(self, lambda_hat: Tensor | None) -> int:
-        if not self.config.dynamic_n_action_steps or lambda_hat is None:
-            return self.config.n_action_steps
-
-        lambda_now = float(lambda_hat.detach().float().mean().clamp(0.0, 1.0).cpu().item())
-        if self._lambda_smooth is None:
-            self._lambda_smooth = lambda_now
-        else:
-            beta = self.config.lambda_ema_beta
-            self._lambda_smooth = beta * self._lambda_smooth + (1.0 - beta) * lambda_now
-        n_exec = compute_dynamic_n_action_steps_with_hysteresis(
-            lambda_value=self._lambda_smooth,
-            current_n=self._dynamic_n_action_steps,
-            n_min=self.config.dynamic_n_action_steps_min,
-            n_max=min(self.config.dynamic_n_action_steps_max, self.config.chunk_size),
-        )
-        self._dynamic_n_action_steps = n_exec
-        return n_exec
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled

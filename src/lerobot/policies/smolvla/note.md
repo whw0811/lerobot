@@ -108,7 +108,6 @@ lerobot-train \
   --policy.chunk_size=50 \
   --policy.n_action_steps=1 \
   --policy.expert_width_multiplier=0.75 \
-  --policy.dynamic_n_action_steps=false \
   --policy.push_to_hub=false \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --dataset.root=/root/autodl-tmp/hf_cache/huggingface/lerobot/HuggingFaceVLA/libero \
@@ -143,8 +142,7 @@ lerobot-eval \
   --eval.n_episodes=10 \
   --policy.path=/root/autodl-tmp/outputs/train/smolvla_baseline/50_0.75/checkpoints/070000/pretrained_model \
   --policy.n_action_steps=10 \
-  --seed=42 \
-  --policy.dynamic_n_action_steps=false
+  --seed=42
 
 二、训练
 2.1 离线 residual predictor 训练 + λ 标签生成
@@ -208,17 +206,14 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate lerobot
 
 lerobot-eval \
-  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda3/10_0.75/060000 \
+  --output_dir=/root/autodl-tmp/outputs/eval/smolvla_vlm_lambda3/50_0.75/070000 \
   --env.type=libero \
   --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
   --eval.batch_size=1 \
   --eval.n_episodes=10 \
-  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda3/10_0.75/checkpoints/060000/pretrained_model \
+  --policy.path=/root/autodl-tmp/outputs/train/smolvla_vlm_lambda3/50_0.75/checkpoints/070000/pretrained_model \
   --policy.n_action_steps=10 \
-  --seed=42 \
-  --policy.dynamic_n_action_steps=false \
-  --policy.dynamic_n_action_steps_min=5 \
-  --policy.dynamic_n_action_steps_max=10
+  --seed=42
 
 python -m lerobot.policies.smolvla.lambda_label_viewer \
   --repo-id=HuggingFaceVLA/libero \

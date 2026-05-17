@@ -110,12 +110,6 @@ class SmolVLAConfig(PreTrainedConfig):
     predict_lambda_with_action_expert: bool = False
     lambda_default_value: float = 0.0
 
-    # Dynamic closed-loop execution from predicted lambda
-    dynamic_n_action_steps: bool = False
-    dynamic_n_action_steps_min: int = 2
-    dynamic_n_action_steps_max: int = 10
-    lambda_ema_beta: float = 0.8
-
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
@@ -134,7 +128,7 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
-        if self.lambda_labels_path is not None or self.dynamic_n_action_steps:
+        if self.lambda_labels_path is not None:
             self.predict_lambda_with_action_expert = True
         if self.lambda_loss_weight < 0:
             raise ValueError("lambda_loss_weight must be non-negative")
@@ -142,14 +136,6 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("lambda_loss_type must be 'smooth_l1' or 'mse'")
         if not 0.0 <= self.lambda_default_value <= 1.0:
             raise ValueError("lambda_default_value must be in [0, 1]")
-        if self.dynamic_n_action_steps_min <= 0:
-            raise ValueError("dynamic_n_action_steps_min must be positive")
-        if self.dynamic_n_action_steps_max < self.dynamic_n_action_steps_min:
-            raise ValueError("dynamic_n_action_steps_max must be >= dynamic_n_action_steps_min")
-        if self.dynamic_n_action_steps_max > self.chunk_size:
-            raise ValueError("dynamic_n_action_steps_max must be <= chunk_size")
-        if not 0.0 <= self.lambda_ema_beta < 1.0:
-            raise ValueError("lambda_ema_beta must be in [0, 1)")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

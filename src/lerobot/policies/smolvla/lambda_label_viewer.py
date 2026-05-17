@@ -67,18 +67,13 @@ def format_lambda_prediction_line(
     index: int,
     lookup: LambdaLabelLookup,
     lambda_hat: Any | None,
-    current_n_action_steps: int | None = None,
 ) -> str:
     values, confidence, valid = lookup.lookup_with_confidence(torch.tensor([index], dtype=torch.long))
-    n_action_steps_part = (
-        f"n_exec={current_n_action_steps} " if current_n_action_steps is not None else ""
-    )
     return (
         f"ep={episode} frame={frame} index={index} "
         f"lambda={float(values[0].item()):.6f} "
         f"alpha={float(confidence[0].item()):.6f} "
         f"lambda_hat={_scalar_float_or_nan(lambda_hat):.6f} "
-        f"{n_action_steps_part}"
         f"valid={bool(valid[0].item())}"
     )
 
@@ -98,13 +93,11 @@ def overlay_text(image: np.ndarray, text: str) -> np.ndarray:
     thickness = 1
     padding = 5
     parts = text.split()
-    lambda_parts = [
-        part for part in parts if part.startswith(("lambda=", "alpha=", "lambda_hat=", "n_exec="))
-    ]
+    lambda_parts = [part for part in parts if part.startswith(("lambda=", "alpha=", "lambda_hat="))]
     metadata = " ".join(
         part
         for part in parts
-        if not part.startswith(("lambda=", "alpha=", "lambda_hat=", "n_exec="))
+        if not part.startswith(("lambda=", "alpha=", "lambda_hat="))
     )
     lines = [metadata, *lambda_parts] if lambda_parts else [text]
     line_sizes = [
@@ -253,20 +246,6 @@ def _get_last_lambda_hat(policy: SmolVLAPolicy) -> torch.Tensor | None:
     return getattr(model, "last_lambda_hat", None)
 
 
-def _get_runtime_n_action_steps(policy: SmolVLAPolicy, lambda_hat: torch.Tensor | None) -> int | None:
-    config = getattr(policy, "config", None)
-    if config is None:
-        return None
-    fallback = getattr(config, "n_action_steps", None)
-    if not getattr(config, "dynamic_n_action_steps", False) or lambda_hat is None:
-        return int(fallback) if fallback is not None else None
-
-    update_dynamic_n_action_steps = getattr(policy, "_update_dynamic_n_action_steps", None)
-    if update_dynamic_n_action_steps is None:
-        return int(fallback) if fallback is not None else None
-    return int(update_dynamic_n_action_steps(lambda_hat))
-
-
 def view_lambda_predictions(
     repo_id: str,
     policy_path: str | Path,
@@ -318,14 +297,12 @@ def view_lambda_predictions(
                 batch = preprocessor(item)
                 policy.predict_action_chunk(batch)
             lambda_hat = _get_last_lambda_hat(policy)
-            current_n_action_steps = _get_runtime_n_action_steps(policy, lambda_hat)
             line = format_lambda_prediction_line(
                 episode=episode,
                 frame=frame,
                 index=index,
                 lookup=lookup,
                 lambda_hat=lambda_hat,
-                current_n_action_steps=current_n_action_steps,
             )
             if print_every > 0 and frame % print_every == 0:
                 print(line, flush=True)
