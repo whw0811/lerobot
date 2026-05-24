@@ -54,7 +54,8 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
-from typing import TypedDict, Unpack
+from pathlib import Path
+from typing import Any, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -79,39 +80,207 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def compute_dynamic_n_action_steps(lambda_value: float, n_min: int, n_max: int) -> int:
+    lambda_value = max(0.0, min(1.0, float(lambda_value)))
+    return max(n_min, min(n_max, round(n_max - lambda_value * (n_max - n_min))))
+
+
+class LambdaHead(nn.Module):
+    default_head_hidden_size = 1024
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_hidden_size: int | None = None,
+        dropout: float = 0.1,
+        num_bins: int = 51,
+    ):
+        super().__init__()
+        if num_bins < 2:
+            raise ValueError("num_bins must be at least 2")
+        head_hidden_size = head_hidden_size or self.default_head_hidden_size
+        self.num_bins = num_bins
+        self.head_hidden_size = head_hidden_size
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, head_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden_size, head_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden_size, num_bins),
+        )
+
+    def forward(self, pooled_hidden: Tensor) -> Tensor:
+        return self.net(pooled_hidden.float())
+
+
+def _normalize_lambda_head_state_dict(state_dict: dict[str, Any]) -> dict[str, Tensor]:
+    normalized = {}
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            continue
+        if "lambda_head." in key:
+            key = key.split("lambda_head.", maxsplit=1)[1]
+        elif key.startswith("module."):
+            key = key.removeprefix("module.")
+        if key.startswith("net."):
+            normalized[key] = value
+
+    if not normalized:
+        raise ValueError("Lambda head checkpoint does not contain lambda head weights")
+    return normalized
+
+
+def load_lambda_head_checkpoint(path: str | Path) -> tuple[dict[str, Tensor], dict[str, Any]]:
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+        metadata = {key: value for key, value in payload.items() if key != "state_dict"}
+    elif isinstance(payload, dict):
+        state_dict = payload
+        metadata = {}
+    else:
+        raise ValueError("Lambda head checkpoint must be a state_dict or a dict with a state_dict field")
+    if not isinstance(state_dict, dict):
+        raise ValueError("Lambda head checkpoint state_dict must be a dict")
+    return _normalize_lambda_head_state_dict(state_dict), metadata
+
+
+def lambda_bin_values(
+    num_bins: int, device: torch.device | str, dtype: torch.dtype = torch.float32
+) -> Tensor:
+    return torch.linspace(0.0, 1.0, num_bins, device=device, dtype=dtype)
+
+
+def lambda_expected_value(logits: Tensor) -> Tensor:
+    probs = torch.softmax(logits.float(), dim=-1)
+    bins = lambda_bin_values(logits.shape[-1], device=logits.device, dtype=probs.dtype)
+    return (probs * bins).sum(dim=-1)
+
+
+def lambda_target_bins(lambda_t: Tensor, num_bins: int, device: torch.device | str) -> Tensor:
+    lambda_t = lambda_t.to(device=device, dtype=torch.float32).clamp(0.0, 1.0).view(-1)
+    return torch.round(lambda_t * (num_bins - 1)).to(dtype=torch.long)
+
+
+class LambdaVelocityAdapter(nn.Module):
+    def __init__(self, hidden_size: int, action_dim: int, condition_dim: int = 1):
+        super().__init__()
+        self.condition_dim = condition_dim
+        self.net = nn.Sequential(
+            nn.Linear(hidden_size + condition_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, action_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, action_suffix_out: Tensor, lambda_condition: Tensor) -> Tensor:
+        lambda_condition = lambda_condition.to(device=action_suffix_out.device, dtype=action_suffix_out.dtype)
+        lambda_condition = lambda_condition.view(action_suffix_out.shape[0], 1, self.condition_dim)
+        lambda_condition = lambda_condition.expand(-1, action_suffix_out.shape[1], -1)
+        return self.net(torch.cat([action_suffix_out, lambda_condition], dim=-1))
+
+
 def compute_lambda_supervision_loss(
-    lambda_hat: Tensor,
     lambda_t: Tensor,
     lambda_is_valid: Tensor,
     lambda_confidence: Tensor | None = None,
+    lambda_hat: Tensor | None = None,
+    lambda_logits: Tensor | None = None,
     loss_type: str = "smooth_l1",
+    variance_weight: float = 0.0,
+    tolerance_margin: float = 0.0,
+    tolerance_weight: float = 0.0,
+    distance_weight: float = 0.0,
+    distance_power: float = 1.0,
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
+    if lambda_logits is not None:
+        lambda_hat = lambda_expected_value(lambda_logits)
+    if lambda_hat is None:
+        raise ValueError("compute_lambda_supervision_loss requires lambda_hat")
     lambda_t = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
-    lambda_is_valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
+    valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
     if lambda_confidence is None:
         confidence = torch.ones_like(lambda_hat)
     else:
-        confidence = lambda_confidence.to(device=lambda_hat.device, dtype=lambda_hat.dtype).view_as(lambda_hat)
+        confidence = lambda_confidence.to(device=lambda_hat.device, dtype=lambda_hat.dtype)
+        confidence = confidence.view_as(lambda_hat)
         confidence = confidence.clamp(0.0, 1.0)
 
-    if loss_type == "smooth_l1":
-        raw_lambda_loss = F.smooth_l1_loss(lambda_hat, lambda_t, reduction="none")
-    elif loss_type == "mse":
-        raw_lambda_loss = F.mse_loss(lambda_hat, lambda_t, reduction="none")
-    else:
+    if loss_type not in {"smooth_l1", "mse"}:
         raise ValueError("loss_type must be 'smooth_l1' or 'mse'")
 
-    zero = torch.zeros_like(raw_lambda_loss)
-    unweighted_per_sample = torch.where(lambda_is_valid, raw_lambda_loss, zero)
-    weighted_per_sample = torch.where(lambda_is_valid, raw_lambda_loss * confidence, zero)
-    valid_count = lambda_is_valid.sum().clamp_min(1)
-    loss = weighted_per_sample.sum() / valid_count
-    unweighted_loss = unweighted_per_sample.sum() / valid_count
-    confidence_mean = torch.where(lambda_is_valid, confidence, torch.zeros_like(confidence)).sum() / valid_count
     stats = {
-        "lambda_loss_unweighted": unweighted_loss.detach().item(),
-        "lambda_confidence_mean": confidence_mean.detach().item(),
+        "lambda_t_mean": lambda_t[valid].detach().mean().item() if bool(valid.any().item()) else 0.0,
+        "lambda_hat_valid_mean": (
+            lambda_hat[valid].detach().mean().item() if bool(valid.any().item()) else 0.0
+        ),
     }
+
+    if lambda_logits is not None:
+        target_bins = lambda_target_bins(lambda_t, lambda_logits.shape[-1], lambda_logits.device)
+        distribution_loss = F.cross_entropy(lambda_logits.float(), target_bins, reduction="none")
+        raw_lambda_loss = distribution_loss
+        stats["lambda_distribution_loss_unweighted"] = (
+            distribution_loss[valid].detach().mean().item() if bool(valid.any().item()) else 0.0
+        )
+
+        if distance_weight > 0:
+            probs = torch.softmax(lambda_logits.float(), dim=-1)
+            bins = lambda_bin_values(lambda_logits.shape[-1], device=lambda_logits.device, dtype=probs.dtype)
+            target_values = lambda_t.to(device=lambda_logits.device, dtype=probs.dtype).view(-1, 1)
+            distance_loss = (probs * (bins.view(1, -1) - target_values).abs().pow(distance_power)).sum(
+                dim=-1
+            )
+            raw_lambda_loss = (
+                raw_lambda_loss + distance_weight * distance_loss.to(dtype=raw_lambda_loss.dtype)
+            )
+            stats["lambda_distance_loss_unweighted"] = (
+                distance_loss[valid].detach().mean().item() if bool(valid.any().item()) else 0.0
+            )
+
+        if tolerance_weight > 0:
+            error = (lambda_hat - lambda_t).abs()
+            excess = (error - tolerance_margin).clamp_min(0.0)
+            target = torch.zeros_like(excess)
+            if loss_type == "smooth_l1":
+                tolerance_loss = F.smooth_l1_loss(excess, target, reduction="none")
+            else:
+                tolerance_loss = F.mse_loss(excess, target, reduction="none")
+            raw_lambda_loss = raw_lambda_loss + tolerance_weight * tolerance_loss
+            stats["lambda_tolerance_loss_unweighted"] = (
+                tolerance_loss[valid].detach().mean().item() if bool(valid.any().item()) else 0.0
+            )
+    elif loss_type == "smooth_l1":
+        raw_lambda_loss = F.smooth_l1_loss(lambda_hat, lambda_t, reduction="none")
+    else:
+        raw_lambda_loss = F.mse_loss(lambda_hat, lambda_t, reduction="none")
+
+    zero = torch.zeros_like(raw_lambda_loss)
+    unweighted_per_sample = torch.where(valid, raw_lambda_loss, zero)
+    weighted_per_sample = torch.where(valid, raw_lambda_loss * confidence, zero)
+    valid_confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
+    valid_count = valid.sum().clamp_min(1)
+    loss = weighted_per_sample.sum() / valid_confidence.sum().clamp_min(1e-6)
+    unweighted_loss = unweighted_per_sample.sum() / valid_count
+    confidence_mean = valid_confidence.sum() / valid_count
+    stats["lambda_loss_unweighted"] = unweighted_loss.detach().item()
+    stats["lambda_confidence_mean"] = confidence_mean.detach().item()
+
+    if variance_weight > 0 and bool(valid.sum().item() > 1):
+        variance_loss = F.mse_loss(lambda_hat[valid].var(), lambda_t[valid].var())
+        loss = loss + variance_weight * variance_loss
+        weighted_per_sample = weighted_per_sample + torch.where(
+            valid,
+            confidence * variance_weight * variance_loss.to(dtype=weighted_per_sample.dtype),
+            zero,
+        )
+        stats["lambda_variance_loss"] = variance_loss.detach().item()
+
     return loss, weighted_per_sample, stats
 
 
@@ -289,6 +458,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._lambda_smooth: float | None = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -306,8 +476,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self) -> list[dict]:
+        default_params = []
+        lambda_head_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if ".lambda_head." in name:
+                lambda_head_params.append(param)
+            else:
+                default_params.append(param)
+
+        param_groups = []
+        if default_params:
+            param_groups.append({"params": default_params})
+        if lambda_head_params:
+            param_groups.append(
+                {
+                    "params": lambda_head_params,
+                    "lr": self.config.lambda_head_optimizer_lr,
+                    "name": "lambda_head",
+                }
+            )
+        return param_groups
 
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
@@ -378,10 +569,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if self._check_get_actions_condition():
             actions = self._get_action_chunk(batch, noise)
+            n_action_steps = self._update_dynamic_n_action_steps(getattr(self.model, "last_lambda_hat", None))
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+            self._queues[ACTION].extend(actions.transpose(0, 1)[:n_action_steps])
 
         return self._queues[ACTION].popleft()
 
@@ -390,6 +582,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _update_dynamic_n_action_steps(self, lambda_hat: Tensor | None) -> int:
+        if not self.config.dynamic_n_action_steps or lambda_hat is None:
+            return self.config.n_action_steps
+
+        lambda_now = float(lambda_hat.detach().float().mean().clamp(0.0, 1.0).item())
+        if self._lambda_smooth is None:
+            self._lambda_smooth = lambda_now
+        else:
+            beta = self.config.lambda_ema_beta
+            self._lambda_smooth = beta * self._lambda_smooth + (1.0 - beta) * lambda_now
+
+        return compute_dynamic_n_action_steps(
+            self._lambda_smooth,
+            n_min=self.config.dynamic_n_action_steps_min,
+            n_max=min(self.config.dynamic_n_action_steps_max, self.config.chunk_size),
+        )
 
     def update(self):
         if hasattr(self.model, "update_lambda_train_step"):
@@ -433,6 +642,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
         losses = model_output["losses"]
         lambda_hat = model_output.get("lambda_hat")
+        lambda_logits = model_output.get("lambda_logits")
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -448,24 +658,33 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         lambda_loss = None
         lambda_loss_per_sample = None
+        lambda_loss_affects_training = not getattr(self.model, "lambda_head_is_frozen", False)
         lambda_t = batch.get("lambda_t")
         lambda_is_valid = batch.get("lambda_is_valid")
         lambda_confidence = batch.get("lambda_confidence")
         if lambda_hat is not None and lambda_t is not None and lambda_is_valid is not None:
             lambda_loss, lambda_loss_per_sample, lambda_stats = compute_lambda_supervision_loss(
                 lambda_hat=lambda_hat,
+                lambda_logits=lambda_logits,
                 lambda_t=lambda_t,
                 lambda_is_valid=lambda_is_valid,
                 lambda_confidence=lambda_confidence,
                 loss_type=self.config.lambda_loss_type,
+                variance_weight=self.config.lambda_variance_weight,
+                tolerance_margin=self.config.lambda_tolerance_margin,
+                tolerance_weight=self.config.lambda_tolerance_weight,
+                distance_weight=self.config.lambda_distance_weight,
+                distance_power=self.config.lambda_distance_power,
             )
             loss_dict["lambda_loss"] = lambda_loss.item()
-            loss_dict["lambda_loss_weighted"] = (self.config.lambda_loss_weight * lambda_loss).item()
+            lambda_loss_weight = self.config.lambda_loss_weight if lambda_loss_affects_training else 0.0
+            loss_dict["lambda_loss_weighted"] = (lambda_loss_weight * lambda_loss).item()
+            loss_dict["lambda_head_frozen"] = float(not lambda_loss_affects_training)
             loss_dict.update(lambda_stats)
             loss_dict["lambda_hat_mean"] = lambda_hat.detach().mean().item()
             lambda_is_valid_for_stats = lambda_is_valid.to(
                 device=lambda_hat.device, dtype=torch.bool
-            ).view_as(lambda_hat)
+            ).view(lambda_hat.shape[0])
             loss_dict["lambda_valid_frac"] = lambda_is_valid_for_stats.float().mean().item()
 
         if reduction == "none":
@@ -477,7 +696,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
             loss_dict["action_loss"] = per_sample_loss.mean().item()
             if lambda_loss_per_sample is not None:
-                per_sample_loss = per_sample_loss + self.config.lambda_loss_weight * lambda_loss_per_sample
+                lambda_loss_weight = self.config.lambda_loss_weight if lambda_loss_affects_training else 0.0
+                per_sample_loss = per_sample_loss + lambda_loss_weight * lambda_loss_per_sample
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -488,7 +708,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
             loss_dict["action_loss"] = loss.item()
-            if lambda_loss is not None:
+            if lambda_loss is not None and lambda_loss_affects_training:
                 loss = loss + self.config.lambda_loss_weight * lambda_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
@@ -582,7 +802,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": ["lambda_query", "lambda_expert_head"],
+            "modules_to_save": ["lambda_head", "lambda_velocity_adapter"],
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -674,13 +894,48 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
-        self.lambda_query = nn.Embedding(1, self.vlm_with_expert.expert_hidden_size)
-        nn.init.zeros_(self.lambda_query.weight)
-        self.lambda_expert_head = nn.Sequential(
-            nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
-            nn.SiLU(),
-            nn.Linear(self.vlm_with_expert.expert_hidden_size, 1),
+        lambda_head_state_dict = None
+        lambda_head_metadata: dict[str, Any] = {}
+        if self.config.lambda_head_pretrained_path is not None:
+            lambda_head_state_dict, lambda_head_metadata = load_lambda_head_checkpoint(
+                self.config.lambda_head_pretrained_path
+            )
+            checkpoint_hidden_size = lambda_head_metadata.get("hidden_size")
+            expected_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+            if checkpoint_hidden_size is not None and int(checkpoint_hidden_size) != expected_hidden_size:
+                raise ValueError(
+                    "Lambda head checkpoint hidden_size "
+                    f"({checkpoint_hidden_size}) does not match SmolVLA prefix hidden size "
+                    f"({expected_hidden_size})."
+                )
+            if lambda_head_metadata.get("head_hidden_size") is not None:
+                self.config.lambda_head_hidden_size = int(lambda_head_metadata["head_hidden_size"])
+            if lambda_head_metadata.get("lambda_num_bins") is not None:
+                self.config.lambda_num_bins = int(lambda_head_metadata["lambda_num_bins"])
+
+        self.lambda_head = LambdaHead(
+            hidden_size=self.vlm_with_expert.config.text_config.hidden_size,
+            head_hidden_size=self.config.lambda_head_hidden_size,
+            dropout=self.config.lambda_head_dropout,
+            num_bins=self.config.lambda_num_bins,
         )
+        self.lambda_head_is_frozen = False
+        if lambda_head_state_dict is not None:
+            self.lambda_head.load_state_dict(
+                lambda_head_state_dict,
+                strict=self.config.lambda_head_strict_load,
+            )
+            if self.config.lambda_freeze_pretrained_head:
+                self.lambda_head.requires_grad_(False)
+                self.lambda_head.eval()
+                self.lambda_head_is_frozen = True
+
+        self.lambda_velocity_adapter = LambdaVelocityAdapter(
+            hidden_size=self.vlm_with_expert.expert_hidden_size,
+            action_dim=self.config.max_action_dim,
+            condition_dim=1,
+        )
+        self.register_buffer("lambda_train_step", torch.zeros((), dtype=torch.long), persistent=True)
         self.last_lambda_hat: Tensor | None = None
 
         self.set_requires_grad()
@@ -724,12 +979,99 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def compute_lambda_hat_from_suffix(self, suffix_out: Tensor) -> Tensor:
-        lambda_out = suffix_out[:, 0].to(dtype=torch.float32)
-        return torch.sigmoid(self.lambda_expert_head(lambda_out)).squeeze(-1)
+    def _lambda_prediction_enabled(self) -> bool:
+        return (
+            self.config.predict_lambda_with_action_expert
+            or self.config.lambda_conditioning
+            or self.config.dynamic_n_action_steps
+        )
+
+    def _lambda_adapter_enabled(self, lambda_condition: Tensor | None) -> bool:
+        return self.config.lambda_conditioning and lambda_condition is not None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.lambda_head_is_frozen:
+            self.lambda_head.eval()
+        return self
+
+    def compute_lambda_hat_from_prefix(
+        self, prefix_out: Tensor, prefix_pad_masks: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        prefix_out = prefix_out.to(dtype=torch.float32)
+        mask = prefix_pad_masks.to(device=prefix_out.device, dtype=prefix_out.dtype).unsqueeze(-1)
+        pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if self.lambda_head_is_frozen:
+            with torch.no_grad():
+                logits = self.lambda_head(pooled)
+                lambda_hat = lambda_expected_value(logits)
+            return lambda_hat.detach(), logits.detach()
+
+        logits = self.lambda_head(pooled)
+        lambda_hat = lambda_expected_value(logits)
+        return lambda_hat, logits
+
+    def compute_lambda_alpha(self) -> float:
+        if self.config.lambda_alpha_warmup_steps == 0:
+            return float(self.config.lambda_alpha_end)
+        progress = min(
+            1.0,
+            float(self.lambda_train_step.item()) / float(self.config.lambda_alpha_warmup_steps),
+        )
+        return float(
+            self.config.lambda_alpha_start
+            + progress * (self.config.lambda_alpha_end - self.config.lambda_alpha_start)
+        )
+
+    def compute_lambda_condition(
+        self,
+        lambda_hat: Tensor,
+        lambda_t: Tensor | None = None,
+        lambda_is_valid: Tensor | None = None,
+        alpha: float = 0.0,
+    ) -> Tensor:
+        pred = lambda_hat.detach()
+        if (
+            self.config.lambda_head_pretrained_path is not None
+            and self.config.lambda_pretrained_prediction_only
+        ):
+            return pred
+        if lambda_t is None or lambda_is_valid is None:
+            return pred
+
+        labels = lambda_t.to(device=lambda_hat.device, dtype=lambda_hat.dtype)
+        labels = labels.view_as(lambda_hat).clamp_min(0.0)
+        valid = lambda_is_valid.to(device=lambda_hat.device, dtype=torch.bool).view_as(lambda_hat)
+        alpha = max(0.0, min(1.0, float(alpha)))
+        mixed = (1.0 - alpha) * labels + alpha * pred
+        return torch.where(valid, mixed, pred).detach()
+
+    def compute_lambda_gate(self, lambda_condition: Tensor, dtype: torch.dtype) -> Tensor:
+        lambda_value = lambda_condition.to(dtype=dtype).view(lambda_condition.shape[0]).clamp(0.0, 1.0)
+        if self.config.lambda_adapter_gate == "lambda":
+            gate = lambda_value
+        elif self.config.lambda_adapter_gate == "sigmoid":
+            gate = torch.sigmoid(
+                self.config.lambda_adapter_sigmoid_slope
+                * (lambda_value - self.config.lambda_adapter_sigmoid_center)
+            )
+        else:
+            raise ValueError("lambda_adapter_gate must be 'lambda' or 'sigmoid'")
+        return gate[:, None, None]
+
+    def compute_lambda_conditioned_velocity(
+        self, action_suffix_out: Tensor, lambda_condition: Tensor | None
+    ) -> Tensor:
+        v_base = self.action_out_proj(action_suffix_out)
+        if not self._lambda_adapter_enabled(lambda_condition):
+            return v_base
+
+        delta_v = self.lambda_velocity_adapter(action_suffix_out, lambda_condition)
+        gate = self.compute_lambda_gate(lambda_condition, dtype=v_base.dtype).to(device=v_base.device)
+        return v_base + self.config.lambda_adapter_scale * gate * delta_v
 
     def update_lambda_train_step(self) -> None:
-        pass
+        self.lambda_train_step.add_(1)
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -853,14 +1195,6 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
-        if self.config.predict_lambda_with_action_expert:
-            lambda_token = self.lambda_query.weight.to(device=device, dtype=dtype)[None, :, :].expand(
-                bsize, -1, -1
-            )
-            embs.append(lambda_token)
-            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
-            att_masks += [1]
-
         # Add to input tokens
         embs.append(action_time_emb)
 
@@ -910,7 +1244,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -919,16 +1253,24 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         lambda_hat = None
-        if self.config.predict_lambda_with_action_expert:
-            lambda_hat = self.compute_lambda_hat_from_suffix(suffix_out)
+        lambda_logits = None
+        lambda_condition = None
+        if self._lambda_prediction_enabled():
+            lambda_hat, lambda_logits = self.compute_lambda_hat_from_prefix(prefix_out, prefix_pad_masks)
+            lambda_condition = self.compute_lambda_condition(
+                lambda_hat=lambda_hat,
+                lambda_t=lambda_t,
+                lambda_is_valid=lambda_is_valid,
+                alpha=self.compute_lambda_alpha(),
+            )
             self.last_lambda_hat = lambda_hat.detach()
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self.compute_lambda_conditioned_velocity(suffix_out, lambda_condition)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return {"losses": losses, "lambda_hat": lambda_hat}
+        return {"losses": losses, "lambda_hat": lambda_hat, "lambda_logits": lambda_logits}
 
     def sample_actions(
         self,
@@ -954,7 +1296,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -962,6 +1304,11 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        prefix_lambda_hat = None
+        if self._lambda_prediction_enabled():
+            prefix_lambda_hat, _ = self.compute_lambda_hat_from_prefix(prefix_outputs[0], prefix_pad_masks)
+            prefix_lambda_hat = prefix_lambda_hat.detach()
+            self.last_lambda_hat = prefix_lambda_hat
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
@@ -977,6 +1324,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    lambda_condition=prefix_lambda_hat,
                 )
 
             if self._rtc_enabled():
@@ -1008,6 +1356,7 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        lambda_condition: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -1032,11 +1381,7 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1]
-        if self.config.predict_lambda_with_action_expert:
-            lambda_hat = self.compute_lambda_hat_from_suffix(suffix_out)
-            self.last_lambda_hat = lambda_hat.detach()
-
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self.compute_lambda_conditioned_velocity(suffix_out, lambda_condition)
         return v_t

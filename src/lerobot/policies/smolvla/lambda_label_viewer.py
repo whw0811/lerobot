@@ -42,23 +42,33 @@ def to_hwc_uint8(image: Any) -> np.ndarray:
 
 
 def format_lambda_line(episode: int, frame: int, index: int, lookup: LambdaLabelLookup) -> str:
-    values, confidence, valid = lookup.lookup_with_confidence(torch.tensor([index], dtype=torch.long))
+    values, _confidence, valid = lookup.lookup_with_confidence(torch.tensor([index], dtype=torch.long))
+    lambda_value = _lambda_float(values[0])
     return (
         f"ep={episode} frame={frame} index={index} "
-        f"lambda={float(values[0].item()):.6f} "
-        f"alpha={float(confidence[0].item()):.6f} "
+        f"lambda={lambda_value:.6f} "
         f"valid={bool(valid[0].item())}"
     )
 
 
-def _scalar_float_or_nan(value: Any | None) -> float:
+def _lambda_float(value: Any | None) -> float:
     if value is None:
         return float("nan")
     if torch.is_tensor(value):
-        return float(value.detach().float().mean().cpu().item())
-    if isinstance(value, np.ndarray):
-        return float(np.asarray(value, dtype=np.float32).mean().item())
-    return float(value)
+        tensor = value.detach().float().cpu()
+    elif isinstance(value, np.ndarray):
+        tensor = torch.as_tensor(np.asarray(value, dtype=np.float32))
+    else:
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+
+    if tensor.ndim == 0:
+        return float(tensor.clamp(0.0, 1.0).item())
+    if tensor.numel() == 1:
+        return float(tensor.reshape(()).clamp(0.0, 1.0).item())
+    if tensor.shape[-1] == 3:
+        tensor = tensor.reshape(-1, 3)[0]
+        return float((tensor[2] + 0.5 * tensor[1]).clamp(0.0, 1.0).item())
+    return float("nan")
 
 
 def format_lambda_prediction_line(
@@ -68,12 +78,13 @@ def format_lambda_prediction_line(
     lookup: LambdaLabelLookup,
     lambda_hat: Any | None,
 ) -> str:
-    values, confidence, valid = lookup.lookup_with_confidence(torch.tensor([index], dtype=torch.long))
+    values, _confidence, valid = lookup.lookup_with_confidence(torch.tensor([index], dtype=torch.long))
+    lambda_value = _lambda_float(values[0])
+    lambda_hat_value = _lambda_float(lambda_hat)
     return (
         f"ep={episode} frame={frame} index={index} "
-        f"lambda={float(values[0].item()):.6f} "
-        f"alpha={float(confidence[0].item()):.6f} "
-        f"lambda_hat={_scalar_float_or_nan(lambda_hat):.6f} "
+        f"lambda={lambda_value:.6f} "
+        f"lambda_hat={lambda_hat_value:.6f} "
         f"valid={bool(valid[0].item())}"
     )
 
@@ -93,11 +104,17 @@ def overlay_text(image: np.ndarray, text: str) -> np.ndarray:
     thickness = 1
     padding = 5
     parts = text.split()
-    lambda_parts = [part for part in parts if part.startswith(("lambda=", "alpha=", "lambda_hat="))]
+    lambda_parts = [
+        part
+        for part in parts
+        if part.startswith(("lambda=", "lambda_hat="))
+    ]
     metadata = " ".join(
         part
         for part in parts
-        if not part.startswith(("lambda=", "alpha=", "lambda_hat="))
+        if not part.startswith(
+            ("lambda=", "lambda_hat=")
+        )
     )
     lines = [metadata, *lambda_parts] if lambda_parts else [text]
     line_sizes = [
@@ -233,7 +250,7 @@ def _load_smolvla_preprocessor(
         )
     except Exception:
         policy.config.lambda_labels_path = str(labels_path)
-        policy.config.lambda_default_value = default_value
+        policy.config.lambda_default_value = float(default_value)
         preprocessor, _postprocessor = make_pre_post_processors(
             policy.config,
             dataset_stats=dataset_stats,

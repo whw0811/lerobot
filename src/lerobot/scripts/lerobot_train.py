@@ -154,6 +154,11 @@ def update_policy(
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     train_metrics.loss = loss.item()
+    if output_dict is not None:
+        if "action_loss" in output_dict and "action_loss" in train_metrics.metrics:
+            train_metrics.action_loss = output_dict["action_loss"]
+        if "lambda_loss" in output_dict and "lambda_loss" in train_metrics.metrics:
+            train_metrics.lambda_loss = output_dict["lambda_loss"]
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -422,13 +427,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     policy.train()
 
-    train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
-        "grad_norm": AverageMeter("grdn", ":.3f"),
-        "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
-    }
+    train_metrics = {"loss": AverageMeter("loss", ":.3f")}
+    if cfg.policy.type == "smolvla" and getattr(cfg.policy, "lambda_labels_path", None) is not None:
+        train_metrics.update(
+            {
+                "action_loss": AverageMeter("act_loss", ":.3f"),
+                "lambda_loss": AverageMeter("lam_loss", ":.3f"),
+            }
+        )
+    train_metrics.update(
+        {
+            "grad_norm": AverageMeter("grdn", ":.3f"),
+            "lr": AverageMeter("lr", ":0.1e"),
+            "update_s": AverageMeter("updt_s", ":.3f"),
+            "dataloading_s": AverageMeter("data_s", ":.3f"),
+        }
+    )
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes

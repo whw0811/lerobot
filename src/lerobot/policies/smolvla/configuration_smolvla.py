@@ -25,7 +25,6 @@ from ..rtc.configuration_rtc import RTCConfig
 @dataclass
 class SmolVLAConfig(PreTrainedConfig):
     # Input / output structure.
-    n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
 
@@ -76,6 +75,7 @@ class SmolVLAConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-10
     optimizer_grad_clip_norm: float = 10
+    lambda_head_optimizer_lr: float = 2e-3
 
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
@@ -105,10 +105,34 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Lambda residual-refinement labels and action-expert prediction
     lambda_labels_path: str | None = None
-    lambda_loss_weight: float = 0.05
+    lambda_loss_weight: float = 1.0
     lambda_loss_type: str = "smooth_l1"
     predict_lambda_with_action_expert: bool = False
+    lambda_conditioning: bool = False
+    lambda_head_pretrained_path: str | None = None
+    lambda_freeze_pretrained_head: bool = True
+    lambda_pretrained_prediction_only: bool = True
+    lambda_head_strict_load: bool = True
+    lambda_head_hidden_size: int | None = None
+    lambda_head_dropout: float = 0.1
+    lambda_num_bins: int = 51
+    lambda_distance_weight: float = 0.0
+    lambda_distance_power: float = 1.0
+    lambda_variance_weight: float = 0.0
+    lambda_tolerance_margin: float = 0.0
+    lambda_tolerance_weight: float = 0.0
+    lambda_alpha_start: float = 0.0
+    lambda_alpha_end: float = 0.0
+    lambda_alpha_warmup_steps: int = 0
+    lambda_adapter_scale: float = 1.0
+    lambda_adapter_gate: str = "lambda"
+    lambda_adapter_sigmoid_center: float = 0.5
+    lambda_adapter_sigmoid_slope: float = 10.0
     lambda_default_value: float = 0.0
+    dynamic_n_action_steps: bool = False
+    dynamic_n_action_steps_min: int = 3
+    dynamic_n_action_steps_max: int = 10
+    lambda_ema_beta: float = 0.8
 
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
@@ -117,25 +141,74 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if self.n_obs_steps <= 0:
-            raise ValueError(f"`n_obs_steps` must be positive, got {self.n_obs_steps}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if self.lambda_head_optimizer_lr <= 0:
+            raise ValueError("lambda_head_optimizer_lr must be positive")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
         if self.lambda_labels_path is not None:
             self.predict_lambda_with_action_expert = True
+            self.lambda_conditioning = True
+        if self.lambda_head_pretrained_path is not None:
+            self.predict_lambda_with_action_expert = True
+            self.lambda_conditioning = True
+        if self.dynamic_n_action_steps:
+            self.predict_lambda_with_action_expert = True
+            self.lambda_conditioning = True
+        if self.lambda_conditioning:
+            self.predict_lambda_with_action_expert = True
         if self.lambda_loss_weight < 0:
             raise ValueError("lambda_loss_weight must be non-negative")
         if self.lambda_loss_type not in {"smooth_l1", "mse"}:
             raise ValueError("lambda_loss_type must be 'smooth_l1' or 'mse'")
+        if self.lambda_head_pretrained_path is not None and len(self.lambda_head_pretrained_path) == 0:
+            raise ValueError("lambda_head_pretrained_path must be None or a non-empty path")
         if not 0.0 <= self.lambda_default_value <= 1.0:
             raise ValueError("lambda_default_value must be in [0, 1]")
+        if self.lambda_head_hidden_size is not None and self.lambda_head_hidden_size <= 0:
+            raise ValueError("lambda_head_hidden_size must be positive")
+        if not 0.0 <= self.lambda_head_dropout <= 1.0:
+            raise ValueError("lambda_head_dropout must be in [0, 1]")
+        if self.lambda_num_bins < 2:
+            raise ValueError("lambda_num_bins must be at least 2")
+        if self.lambda_distance_weight < 0:
+            raise ValueError("lambda_distance_weight must be non-negative")
+        if self.lambda_distance_power <= 0:
+            raise ValueError("lambda_distance_power must be positive")
+        if self.lambda_variance_weight < 0:
+            raise ValueError("lambda_variance_weight must be non-negative")
+        if self.lambda_tolerance_margin < 0:
+            raise ValueError("lambda_tolerance_margin must be non-negative")
+        if self.lambda_tolerance_weight < 0:
+            raise ValueError("lambda_tolerance_weight must be non-negative")
+        if not 0.0 <= self.lambda_alpha_start <= 1.0:
+            raise ValueError("lambda_alpha_start must be in [0, 1]")
+        if not 0.0 <= self.lambda_alpha_end <= 1.0:
+            raise ValueError("lambda_alpha_end must be in [0, 1]")
+        if self.lambda_alpha_warmup_steps < 0:
+            raise ValueError("lambda_alpha_warmup_steps must be non-negative")
+        if self.lambda_adapter_scale < 0:
+            raise ValueError("lambda_adapter_scale must be non-negative")
+        if self.lambda_adapter_gate not in {"lambda", "sigmoid"}:
+            raise ValueError("lambda_adapter_gate must be 'lambda' or 'sigmoid'")
+        if not 0.0 <= self.lambda_adapter_sigmoid_center <= 1.0:
+            raise ValueError("lambda_adapter_sigmoid_center must be in [0, 1]")
+        if self.lambda_adapter_sigmoid_slope <= 0:
+            raise ValueError("lambda_adapter_sigmoid_slope must be positive")
+        if self.dynamic_n_action_steps_min <= 0:
+            raise ValueError("dynamic_n_action_steps_min must be positive")
+        if self.dynamic_n_action_steps_max < self.dynamic_n_action_steps_min:
+            raise ValueError("dynamic_n_action_steps_max must be >= dynamic_n_action_steps_min")
+        if self.dynamic_n_action_steps_max > self.chunk_size:
+            raise ValueError("dynamic_n_action_steps_max must be <= chunk_size")
+        if not 0.0 <= self.lambda_ema_beta <= 1.0:
+            raise ValueError("lambda_ema_beta must be in [0, 1]")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
@@ -165,7 +238,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        return [0]
 
     @property
     def action_delta_indices(self) -> list:

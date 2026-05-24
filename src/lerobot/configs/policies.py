@@ -43,8 +43,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     Base configuration class for policy models.
 
     Args:
-        n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
-            current step and additional steps going back).
         input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
             the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
@@ -52,8 +50,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
     """
-
-    n_obs_steps: int = 1
 
     # `input_features` can be set to None/null in order to infer those values from the dataset.
     input_features: dict[str, PolicyFeature] | None = field(default_factory=dict)
